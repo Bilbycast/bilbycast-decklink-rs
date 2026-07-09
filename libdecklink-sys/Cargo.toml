@@ -1,26 +1,14 @@
 [package]
 name = "libdecklink-sys"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MPL-2.0"
 publish = false
-description = "Raw FFI bindings to FFmpeg libavdevice/libavformat/libavcodec/libavutil for Blackmagic DeckLink SDI capture and playout (the `decklink` avdevice)"
-# libavdevice is the entry point (av_input/output device enumeration lives
-# there), so key the `links` on it — one -sys crate per native lib name in
-# the workspace, same rule libffmpeg-video-sys follows with `avcodec`.
-links = "avdevice"
-
-[features]
-default = []
-# Use a system-installed FFmpeg that was ALREADY built with
-# `--enable-decklink` (e.g. a Blackmagic-provided or from-source ffmpeg),
-# discovered via pkg-config. Skips the vendored build entirely. This is the
-# fast path on a dev box that already has such an ffmpeg on PKG_CONFIG_PATH.
-system-ffmpeg = []
+description = "Raw FFI to a C ABI shim over the Blackmagic DeckLink SDK (capture)"
 
 [lib]
 doctest = false
 
 [build-dependencies]
 bindgen = "0.72.1"
-pkg-config = "0.3.33"
+cc = "1"

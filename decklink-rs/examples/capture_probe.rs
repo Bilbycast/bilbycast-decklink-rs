@@ -1,11 +1,11 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 //
-//! Capture a fixed number of frames from a DeckLink input and report what
-//! arrived. Proves `DecklinkCapture` end-to-end against a live SDI source.
+//! Capture frames from a DeckLink input and report what arrived, including
+//! whether the card reports a locked input signal.
 //!
-//!   LIBDECKLINK_FFMPEG_DIR=~/ffmpeg-decklink LD_LIBRARY_PATH=~/ffmpeg-decklink/lib:/lib \
-//!   cargo run -p decklink-rs --example capture_probe -- "DeckLink Quad (1)" Hi50
+//!   DECKLINK_SDK_DIR=~/decklink-sdk-include \
+//!   cargo run -p decklink-rs --example capture_probe -- "DeckLink Quad (1)" auto
 
 use decklink_rs::{CapturedFrame, DecklinkCapture, DecklinkCaptureConfig, DecklinkPixelFormat};
 
@@ -30,33 +30,33 @@ fn main() {
         }
     };
     let (w, h) = cap.video_dimensions();
-    println!("opened {device:?}: detected {w}x{h}");
+    let (n, d) = cap.video_frame_rate();
+    println!("opened {device:?}: detected {w}x{h} @ {n}/{d}");
 
-    let (mut vframes, mut aframes, mut vbytes, mut abytes) = (0u64, 0u64, 0u64, 0u64);
-    let mut first_audio_chans = 0u8;
-    // ~2 seconds of a 25/50 fps signal plus its audio blocks.
-    let target_video = 50u64;
-    while vframes < target_video {
+    let (mut vframes, mut aframes, mut with_signal, mut no_signal) = (0u64, 0u64, 0u64, 0u64);
+    let target = 50u64;
+    while vframes < target {
         match cap.read_frame() {
             Ok(CapturedFrame::Video(v)) => {
                 vframes += 1;
-                vbytes += v.data.len() as u64;
+                if v.signal_present {
+                    with_signal += 1
+                } else {
+                    no_signal += 1
+                }
                 if vframes == 1 {
                     println!(
-                        "first video frame: {}x{} {} stride={} bytes={}",
+                        "first video frame: {}x{} {} stride={} bytes={} signal_present={}",
                         v.width,
                         v.height,
                         v.pixel_format,
                         v.stride,
-                        v.data.len()
+                        v.data.len(),
+                        v.signal_present
                     );
                 }
             }
-            Ok(CapturedFrame::Audio(a)) => {
-                aframes += 1;
-                abytes += (a.samples.len() * 4) as u64;
-                first_audio_chans = a.channels;
-            }
+            Ok(CapturedFrame::Audio(_)) => aframes += 1,
             Err(e) => {
                 eprintln!("read_frame ended: {e}");
                 break;
@@ -65,6 +65,8 @@ fn main() {
     }
 
     println!(
-        "captured: {vframes} video frames ({vbytes} B), {aframes} audio blocks ({abytes} B, {first_audio_chans} ch)"
+        "captured {vframes} video ({with_signal} with signal, {no_signal} NO SIGNAL), \
+         {aframes} audio blocks; shim dropped {}",
+        cap.dropped_frames()
     );
 }

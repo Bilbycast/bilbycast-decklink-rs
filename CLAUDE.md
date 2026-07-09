@@ -2,134 +2,83 @@
 
 ## What Is This
 
-Rust wrapper around FFmpeg's **libavdevice / libavformat** `decklink` device
-for Blackmagic **DeckLink** SDI capture and playout, for bilbycast-edge. It is
-the SDI sibling of `bilbycast-ffmpeg-video-rs` (codec layer) and
-`bilbycast-mxl-rs` (MXL shared-memory layer), used only when bilbycast-edge is
-built with `--features sdi-decklink` (default **off**).
-
-Deliberately a **separate crate** from `bilbycast-ffmpeg-video-rs`: that crate
-builds a minimal FFmpeg with `--disable-avdevice --disable-avformat` and zero
-proprietary linkage (LGPL-clean, redistributable). DeckLink needs *both* of
-those libs plus the proprietary **Blackmagic DeckLink SDK** headers and
-`--enable-nonfree` at FFmpeg-configure time. Isolating that here keeps the
-codec crate clean and keeps the non-free linkage behind one opt-in feature.
+Safe Rust **SDI capture** for Blackmagic **DeckLink** cards, talking to the
+Blackmagic DeckLink SDK directly. Used only when bilbycast-edge is built with
+`--features sdi-decklink` (default **off**).
 
 ## Projects
 
 | Crate | Role |
 |-------|------|
-| **libdecklink-sys** | Raw FFI (bindgen) over libavdevice/libavformat/libavcodec/libavutil. `links = "avdevice"`. |
-| **decklink-rs** | Safe wrapper — `DecklinkCapture`, `DecklinkPlayout`, `enumerate_devices`, and the `Captured*` / `Decklink*Config` types. The crate bilbycast-edge depends on. |
+| **libdecklink-sys** | `shim/decklink_shim.{h,cpp}` — a C++ shim exposing a C ABI over the SDK — plus bindgen FFI for it. Compiled with `cc` together with the SDK's `DeckLinkAPIDispatch.cpp`. |
+| **decklink-rs** | Safe wrapper: `enumerate_devices`, `DecklinkCapture`, and the `Captured*` / `Decklink*Config` types. The crate bilbycast-edge depends on. |
 
-## The FFmpeg-with-DeckLink prerequisite (the crux)
+## Why the SDK, not FFmpeg's `decklink` avdevice
 
-`-f decklink` only exists in an FFmpeg configured against the DeckLink SDK:
+The original implementation went through `libavdevice`. It worked, but it hides
+`bmdFrameHasNoInputSource`: on signal loss FFmpeg silently substitutes colour
+bars, so **a pulled cable is indistinguishable from a healthy feed**. That was
+proven on hardware — pulling the SDI cable produced no error, no event, and a
+perfectly "healthy" 10 Mbps stream.
 
-```bash
-# 1. Get the Blackmagic DeckLink SDK (accept the EULA) — Linux/include only:
-#    DeckLinkAPI.h, DeckLinkAPIVersion.h etc. The Desktop Video *runtime* deb
-#    is NOT enough (it ships libDeckLinkAPI.so but no headers).
-export DECKLINK_SDK_DIR="$HOME/decklink-sdk-include"   # the SDK's Linux/include
+Going straight to the SDK also removed a lot of incidental pain:
 
-# 2. Build FFmpeg with avdevice + avformat + the decklink device.
-#    IMPORTANT — version + flags, both learned the hard way on bilby-z440:
-#    - Use FFmpeg **>= 8.0** (n8.1.2 verified). FFmpeg 7.1.x's DeckLink code
-#      predates SDK 16.0's IDeckLinkVideoInputFrame / memory-allocator API and
-#      will NOT compile against it.
-#    - Pass the SDK include via BOTH --extra-cflags AND **--extra-cxxflags**.
-#      FFmpeg 8.x compiles the decklink_*.cpp device files as C++ and no longer
-#      folds --extra-cflags into the C++ compile, so cxxflags is required or
-#      DeckLinkAPIVersion.h is "not found".
-git clone --depth 1 --branch n8.1.2 https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
-cd ffmpeg-src
-./configure --prefix="$HOME/ffmpeg-decklink" \
-  --enable-avdevice --enable-avformat --enable-avcodec --enable-avutil \
-  --enable-swscale --enable-swresample \
-  --enable-decklink --enable-nonfree \
-  --extra-cflags="-I$DECKLINK_SDK_DIR" \
-  --extra-cxxflags="-I$DECKLINK_SDK_DIR" \
-  --extra-ldflags="-L$DECKLINK_SDK_DIR" \
-  --enable-shared --disable-static \
-  --disable-programs --enable-ffmpeg --disable-doc
-make -j"$(nproc)" && make install
+* No `--enable-decklink --enable-nonfree` FFmpeg build. The edge binary is no
+  longer non-redistributable.
+* No FFmpeg >= 8 requirement (DeckLink SDK 16 only compiles into FFmpeg 8+).
+* No duplicate `libav*` symbols. The edge already statically links a vendored
+  FFmpeg via `video-engine`; adding a second FFmpeg for avdevice caused a symbol
+  clash that had to be solved by unifying both on one shared build.
+* Device enumeration no longer wedges the card (see below).
 
-# 3. Point this crate at that prefix (runtime needs LD_LIBRARY_PATH too):
-export LIBDECKLINK_FFMPEG_DIR="$HOME/ffmpeg-decklink"
-export LD_LIBRARY_PATH="$HOME/ffmpeg-decklink/lib:/lib"
-export PKG_CONFIG_PATH="$HOME/ffmpeg-decklink/lib/pkgconfig"
-cargo run -p decklink-rs --example list_devices   # enumerate the live card
-```
+## Why a C++ shim
 
-Alternatively `--features system-ffmpeg` pkg-configs a system FFmpeg that
-already has `--enable-decklink` (rare on distro packages).
+The DeckLink API is COM-style C++: frames arrive via `IDeckLinkInputCallback`, a
+pure-virtual interface Rust cannot implement. The shim owns that callback, pushes
+frames onto a bounded queue, and exposes a blocking `dl_read_frame`.
 
-The build script does **not** vendor+build FFmpeg itself: the SDK EULA and the
-non-free flag mean the operator must stage the SDK explicitly. See
-`libdecklink-sys/build.rs`.
+Frames are zero-copy inside the shim; `decklink-rs` copies each frame into an
+owned buffer and releases the SDK frame immediately, because holding SDK frames
+starves the card of capture buffers.
 
 ## Build & Test
 
+Only the SDK **headers** are needed at build time — `DeckLinkAPIDispatch.cpp`
+`dlopen`s `libDeckLinkAPI.so` at runtime.
+
 ```bash
-# On bilby-z440 (the SDI test host — DeckLink Quad 2, 8 channels):
-export LIBDECKLINK_FFMPEG_DIR="$HOME/ffmpeg-decklink"
+# Blackmagic "Desktop Video SDK" (accept the EULA) -> Linux/include
+export DECKLINK_SDK_DIR=$HOME/decklink-sdk-include
 cargo build
-cargo test                       # enumerate_devices() against real hardware
+
+# On a host with a card + Desktop Video installed:
+cargo run -p decklink-rs --example list_devices
+cargo run -p decklink-rs --example capture_probe -- "DeckLink Quad (1)" auto
 ```
 
-### Prerequisites
+Prereqs: a C++ toolchain, `clang` (bindgen), and Blackmagic **Desktop Video** at
+runtime (kernel driver + `libDeckLinkAPI.so`).
 
-- **Clang/LLVM** (bindgen), **pkg-config**.
-- An FFmpeg built with `--enable-decklink` (see above) reachable via
-  `LIBDECKLINK_FFMPEG_DIR` or `--features system-ffmpeg`.
-- **Blackmagic Desktop Video** runtime installed (kernel module + `libDeckLinkAPI.so`).
-  On bilby-z440: Desktop Video 16.0.1a2, firmware 0x128, `/dev/blackmagic/io0`–`io7`.
+## SDK gotchas (learned the hard way)
 
-## Architecture
-
-- FFmpeg's `decklink` **indev** yields an `AVFormatContext` with a raw-video
-  stream (`uyvy422` 8-bit or `v210` 10-bit) plus, optionally, a PCM stream
-  (up to 16 ch `pcm_s16le`/`pcm_s32le`). `DecklinkCapture::read_frame` is a
-  blocking `av_read_frame` loop demuxing into `CapturedFrame::{Video,Audio}`.
-- The `decklink` **outdev** is the mirror: raw video + PCM AVPackets via
-  `av_interleaved_write_frame` (`DecklinkPlayout`).
-- **No codec work here.** Only raw essence crosses the SDI boundary. Encode
-  (SDI-in → H.264/HEVC → TS) and decode (TS → YUV → SDI-out) stay in
-  bilbycast-edge's `video-engine`, so the two FFmpeg builds never overlap on
-  codecs. This is the same split MXL uses (V210 grains in/out; encode in edge).
-
-## Key Design Constraints
-
-1. **Send but not Sync** — handles move between threads, need `&mut`.
-2. **Blocking API** — `read_frame` / `write_*` block on the SDI cadence; the
-   bilbycast-edge side drives them under `spawn_blocking` / `block_in_place`,
-   exactly like the MXL grain reader/writer.
-3. **Feature-gated off in bilbycast-edge** (`sdi-decklink`). Never default-on —
-   both the build prereq footprint and the non-free FFmpeg linkage warrant it.
-4. **Infallible enumeration** — `enumerate_devices()` returns empty (never
-   panics) on non-SDI hosts, so the edge `hardware_probe` degrades cleanly.
-
-## Integration with bilbycast-edge
-
-Path dependency, gated by the `sdi-decklink` feature:
-
-```toml
-[dependencies]
-decklink-rs = { path = "../bilbycast-decklink-rs/decklink-rs", optional = true }
-
-[features]
-sdi-decklink = ["dep:decklink-rs"]
-```
-
-Driven from `engine::sdi_io` (capture → `video-engine` encode → `TsMuxer` →
-broadcast; broadcast → `TsDemuxer` → `video-engine` decode → playout),
-mirroring `engine::mxl_video_io`. Targets upstream issue
-[bilbycast-edge#19](https://github.com/Bilbycast/bilbycast-edge/issues/19).
+* **SDK 16 moved `GetBytes`.** It is no longer on `IDeckLinkVideoInputFrame`;
+  `QueryInterface(IID_IDeckLinkVideoBuffer)` then `StartAccess(bmdBufferAccessRead)`
+  / `GetBytes` / `EndAccess`. The pointer is only valid inside that window, so the
+  shim holds the buffer in the access state until the frame is released. (This is
+  also why FFmpeg 7.1 will not compile against SDK 16.)
+* **Format detection needs a settle window.** The input is armed on a *seed*
+  mode, so the very first frame can still report the seed's raster/rate. `open`
+  drains for ~400 ms so `VideoInputFormatChanged` can fire.
+* **DeckLink display modes are literally FourCCs** — `"Hp50"` is
+  `bmdModeHD1080p50`, so a mode string maps to `BMDDisplayMode` directly.
+* **Signal loss does not stop the stream.** The card keeps delivering frames with
+  `bmdFrameHasNoInputSource` set. Callers should keep encoding (holding the
+  transport stream up is what downstream wants) and raise an alarm.
 
 ## Known-good bilbycast-edge SDI config
 
-Verified end-to-end on bilby-z440 (live 1080p50 source → NVENC → SRT, correct
-colours, audio, no freezing). Run the edge with `BILBYCAST_PROBE_SESSION_LIMITS=0`.
+Verified on bilby-z440 (live 1080i50 source → NVENC → SRT: correct colours,
+audio, no freezing). Run the edge with `BILBYCAST_PROBE_SESSION_LIMITS=0`.
 
 ```json
 { "id": "sdi1", "name": "SDI 1", "type": "sdi",
@@ -145,49 +94,50 @@ colours, audio, no freezing). Run the edge with `BILBYCAST_PROBE_SESSION_LIMITS=
 }
 ```
 
-Gotchas the hard way:
+Gotchas:
 
-* **`format` must be `"auto"`.** A forced `format_code` (e.g. `Hp50`) makes the
-  card emit its internal **no-signal colour bars** even when a valid signal is
-  present.
-* **`tune` must be `""` for NVENC.** The edge defaults `tune` to
-  `"zerolatency"`, an x264-only tune — NVENC rejects it and `avcodec_open2`
-  fails with `EINVAL` (`-22`).
+* **`format` must be `"auto"`.** A forced mode that does not match the source
+  makes the card report no signal and emit bars. (Confirmed: forcing `Hp50` on a
+  1080i50 source gives `signal_present = false` on every frame.)
+* **`tune` must be `""` for NVENC.** The edge defaults `tune` to `"zerolatency"`,
+  an x264-only tune — NVENC rejects it and `avcodec_open2` fails with `EINVAL`.
 * **`chroma` must be `"yuv420p"` for `h264_nvenc`** (h264 NVENC has no 4:2:2
   path; only `hevc_nvenc` does).
-* **Bitrate**: 25 Mbps overran the SRT egress here (subscriber lagged, ~0.4 %
-  TS packet loss → visible freezing). 10 Mbps is clean.
-* **Always benchmark the `--release` build** — debug is ~4× the CPU.
+* **Bitrate**: 25 Mbps overran SRT egress here (~0.4 % TS packet loss → visible
+  freezing). 10 Mbps is clean.
+* **Always benchmark the `--release` build** — debug is ~4x the CPU.
 
 ## Upstream bilbycast-edge bugs found during bring-up
 
-Worth reporting alongside the SDI PR — none are SDI-specific:
+None are SDI-specific; worth reporting alongside the SDI PR:
 
 1. `video_encode_util::build_encoder_config` defaults `tune = "zerolatency"`,
    which is invalid for every NVENC backend ⇒ `avcodec_open2` EINVAL.
 2. `video_encode_util::try_build_scaler` skips conversion when
-   `dims_match && is_planar_yuv(src)` — it never checks the planar layout
-   matches the **encoder's** chroma. A planar 4:2:2 source with a 4:2:0
-   encoder target is fed through unconverted, so the encoder reads chroma from
-   the wrong rows (perfect luma, ghosted/smeared chroma). Also affects
-   ST 2110-20 ingest with a 4:2:2 source.
-3. Ingress encoder failures were reported only via `event_sender.emit`
-   (manager events), so a standalone edge fails silently. `sdi_io.rs` now also
-   logs them via `tracing`.
+   `dims_match && is_planar_yuv(src)` — it never checks the planar layout matches
+   the **encoder's** chroma. A planar 4:2:2 source with a 4:2:0 encoder target is
+   fed through unconverted, so the encoder reads chroma from the wrong rows
+   (perfect luma, ghosted/smeared chroma). Also affects ST 2110-20 ingest.
+3. Ingress encoder failures were reported only via `event_sender.emit` (manager
+   events), so a standalone edge fails silently. `sdi_io.rs` now also logs them.
 
-## Status
+## Key Design Constraints
 
-- ✅ **`enumerate_devices()` — verified on bilby-z440** (2026-07-01).
-  Builds against FFmpeg n8.1.2 + DeckLink SDK 16.0 and enumerates the live
-  DeckLink Quad: 8 devices `"DeckLink Quad (1)"`..`"(8)"`, persistent IDs
-  `80:3142d35X:00000000`, `sdi_channel` 1..8, all input+output capable.
-- ✅ **`DecklinkCapture` (open + read_frame) — verified against a live SDI
-  source** on port 1 (2026-07-01). 1080i50 auto/`Hi50`, UYVY422 8-bit video
-  (stride 3840, 4,147,200 B/frame) + 48 kHz stereo s32 PCM, at realtime.
-  Example: `cargo run -p decklink-rs --example capture_probe -- "DeckLink Quad (1)" Hi50`.
-- ⏳ `DecklinkPlayout` FFI still `todo!()` — next bring-up target
-  (`avformat_alloc_output_context2` → raw video + PCM streams →
-  `av_interleaved_write_frame`); needs the io0→io1 loopback to verify.
+1. **Send but not Sync** — handles move between threads, need `&mut`.
+2. **Blocking API** — `read_frame` blocks on the SDI cadence; drive it under
+   `spawn_blocking` / `block_in_place`.
+3. **No codec work here** — only raw essence crosses the SDI boundary. Encode
+   stays in bilbycast-edge's `video-engine`.
+4. **Feature-gated off in bilbycast-edge** (`sdi-decklink`). Never default-on.
+5. **Never panic** — this crate is linked into a long-running broadcast binary.
+   Unimplemented playout returns `Error::Unsupported`, not `todo!()`.
 
-The card reports as **"DeckLink Quad"** (not "Quad 2") — use that exact string
-in bilbycast-edge `SdiInputConfig::device`.
+## Historical note: the enumerate wedge
+
+The FFmpeg-based implementation had a nasty bug: `avdevice_list_input_sources` on
+the `decklink` device left FFmpeg's decklink discovery un-released, which wedged
+the card for the rest of the process — every later `DecklinkCapture::open`
+returned `EIO`. The edge's boot probe had to skip enumeration entirely.
+
+The SDK path releases its iterator cleanly, so enumeration is safe again;
+`enumerate_devices` followed immediately by a capture is verified working.

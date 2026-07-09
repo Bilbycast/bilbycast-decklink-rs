@@ -1,39 +1,59 @@
 # bilbycast-decklink-rs
 
-Safe Rust SDI capture and playout for **Blackmagic DeckLink** cards, via
-FFmpeg's `decklink` avdevice. The SDI I/O backend for
-[bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge) (feature
-`sdi-decklink`, off by default), targeting upstream issue
+Safe Rust SDI **capture** for **Blackmagic DeckLink** cards, talking to the
+Blackmagic DeckLink SDK directly. Backs
+[bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge)'s `sdi-decklink`
+feature (off by default), targeting upstream issue
 [#19](https://github.com/Bilbycast/bilbycast-edge/issues/19).
 
 ```
 bilbycast-decklink-rs/
-├── libdecklink-sys/   raw FFI (bindgen) over FFmpeg libavdevice/libavformat/libavcodec/libavutil
-└── decklink-rs/       safe wrapper: DecklinkCapture, DecklinkPlayout, enumerate_devices
+├── libdecklink-sys/   C++ shim exposing a C ABI over the SDK, + bindgen FFI
+│   └── shim/          decklink_shim.{h,cpp}
+└── decklink-rs/       safe wrapper: DecklinkCapture, enumerate_devices
 ```
 
-## Why a separate crate from bilbycast-ffmpeg-video-rs?
+## Why the SDK and not FFmpeg's `decklink` avdevice
 
-That crate ships a minimal, LGPL-clean FFmpeg with `--disable-avdevice
---disable-avformat`. DeckLink needs both of those libraries **plus** the
-proprietary Blackmagic DeckLink SDK and `--enable-nonfree`. Keeping it separate
-keeps the codec crate clean and confines the non-free linkage to one opt-in
-feature.
+FFmpeg's avdevice works, but it hides `bmdFrameHasNoInputSource`: on signal loss
+it silently substitutes colour bars, so **a pulled cable is indistinguishable
+from a healthy feed**. Going to the SDK directly also avoids a lot of incidental
+pain:
 
-## Quick start (on a host with a DeckLink card)
+* no `--enable-decklink --enable-nonfree` FFmpeg build — the edge binary stays
+  redistributable;
+* no FFmpeg >= 8 requirement;
+* no duplicate `libav*` symbols in a binary that already links FFmpeg;
+* device enumeration that doesn't wedge the card.
+
+## Build
+
+Only the SDK **headers** are needed at build time. `DeckLinkAPIDispatch.cpp`
+`dlopen`s `libDeckLinkAPI.so` at runtime.
 
 ```bash
-# Build an FFmpeg with the decklink device (see CLAUDE.md for the SDK setup):
-export LIBDECKLINK_FFMPEG_DIR="$HOME/ffmpeg-decklink"
+# Blackmagic "Desktop Video SDK" -> Linux/include
+export DECKLINK_SDK_DIR=/path/to/Blackmagic_DeckLink_SDK/Linux/include
 cargo build
-cargo test        # runs enumerate_devices() against the real card
+
+# On a host with a card + Desktop Video installed:
+cargo run -p decklink-rs --example list_devices
+cargo run -p decklink-rs --example capture_probe -- "DeckLink Quad (1)" auto
 ```
 
-See [CLAUDE.md](CLAUDE.md) for the full FFmpeg-with-DeckLink build recipe,
-prerequisites, and design notes.
+Runtime requires Blackmagic **Desktop Video** (kernel driver + `libDeckLinkAPI.so`).
+
+See [CLAUDE.md](CLAUDE.md) for design notes, the known-good bilbycast-edge
+config, and the upstream bugs found during bring-up.
+
+## Status
+
+* `enumerate_devices` and `DecklinkCapture` — implemented, verified on a
+  DeckLink Quad 2 against a live 1080i50 source.
+* `DecklinkPlayout` — not implemented; returns `Error::Unsupported` (never
+  panics: this crate is linked into a long-running broadcast binary).
 
 ## License
 
-MPL-2.0 for the wrapper code. Note: a binary linking FFmpeg's `--enable-nonfree
---enable-decklink` device is **not redistributable** — intended for private
-on-prem edge deployment only (which is why the feature is opt-in).
+MPL-2.0. The DeckLink SDK itself is Blackmagic's and is not redistributed here —
+only our own shim sources.
