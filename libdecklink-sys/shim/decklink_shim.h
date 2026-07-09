@@ -74,6 +74,45 @@ int32_t dl_device_count(void);
 /* Writes the device's display name (e.g. "DeckLink Quad (1)") into `buf`. */
 int32_t dl_device_name(int32_t index, char *buf, size_t buf_len);
 
+/* ── device status ────────────────────────────────────────────────────── */
+/*
+ * A read-only snapshot from `IDeckLinkStatus`. Queryable on a device this
+ * process does NOT hold open, and concurrently with a capture in progress, so
+ * a host can report signal presence on every SDI port at once.
+ *
+ * Fields the card declines to answer come back as the sentinels below rather
+ * than a guess. On an unlocked port every `detected_*` field is unsupported —
+ * the card genuinely does not know. (Note the SDK's *current* video input mode
+ * is deliberately not exposed: on an unlocked port it returns a meaningless
+ * 'ntsc' default rather than failing, so it cannot be told apart from a real
+ * NTSC signal.)
+ */
+#define DL_STATUS_UNKNOWN_TRI (-1) /* int32_t tri-state: no answer */
+#define DL_STATUS_UNKNOWN_FCC 0    /* int64_t FourCC: no answer */
+
+typedef struct {
+    /* tri-state: 0 = false, 1 = true, DL_STATUS_UNKNOWN_TRI = unsupported */
+    int32_t signal_locked;    /* input locked to an SDI signal */
+    int32_t reference_locked; /* locked to house reference (genlock) */
+    int32_t ancillary_locked; /* ancillary data stream locked */
+    int32_t busy;             /* device in use (by us or another process) */
+
+    /* FourCC, or DL_STATUS_UNKNOWN_FCC */
+    int64_t detected_mode;            /* e.g. 'Hi50' */
+    int64_t detected_colorspace;      /* e.g. 'r709' */
+    int64_t detected_field_dominance; /* e.g. 'uppr' */
+    int64_t sdi_link_config;          /* e.g. 'lcsl' (single link) */
+    int64_t reference_mode;           /* raster of the reference signal */
+
+    /* DL_STATUS_UNKNOWN_TRI when unsupported */
+    int32_t detected_dynamic_range; /* BMDDynamicRange; 0 == SDR */
+    int32_t pcie_link_speed;        /* PCIe generation, e.g. 2 */
+    int32_t pcie_link_width;        /* PCIe lanes, e.g. 4 */
+} dl_device_status;
+
+/* Fills `out` for the device at `index`. Does not open or reserve the device. */
+int32_t dl_device_status_get(int32_t index, dl_device_status *out);
+
 /* ── capture ──────────────────────────────────────────────────────────── */
 /*
  * `device`  - display name to match, or NULL for the first device.

@@ -191,6 +191,124 @@ fn parse_sdi_channel(name: &str) -> Option<u8> {
     name[open + 1..close].trim().parse().ok()
 }
 
+/// `bmdModeUnknown` — the SDK's "I have nothing to report" raster FourCC
+/// (`'iunk'`), returned in place of an error by several status fields.
+const BMD_MODE_UNKNOWN: i64 = 0x6975_6E6B;
+
+/// Decode a DeckLink FourCC status value (e.g. `0x48693530` → `"Hi50"`).
+///
+/// Returns `None` for the zero sentinel and for any value that is not four
+/// printable ASCII bytes — better to report nothing than to hand the operator
+/// mojibake.
+fn fourcc_to_string(v: i64) -> Option<String> {
+    if v == 0 {
+        return None;
+    }
+    // `bmdModeUnknown`. The card returns this rather than failing when it has
+    // nothing to report (e.g. `reference_mode` with no reference connected),
+    // so map it to `None` instead of handing the operator a fake raster.
+    if v == BMD_MODE_UNKNOWN {
+        return None;
+    }
+    let b = [
+        ((v >> 24) & 0xFF) as u8,
+        ((v >> 16) & 0xFF) as u8,
+        ((v >> 8) & 0xFF) as u8,
+        (v & 0xFF) as u8,
+    ];
+    if b.iter().any(|c| !c.is_ascii_graphic() && *c != b' ') {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&b).trim().to_string())
+}
+
+/// Convert the shim's tri-state (`-1` unknown) into an `Option<bool>`.
+fn tri_to_bool(v: i32) -> Option<bool> {
+    match v {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// A read-only snapshot of one device's hardware status.
+///
+/// Every field is `Option` because the card answers per-field: an unlocked
+/// input genuinely does not know its colorspace or raster, and older/simpler
+/// models decline fields entirely. `None` means "the card did not say", never
+/// "no" — conflating those is precisely the failure that motivated moving off
+/// FFmpeg's avdevice.
+///
+/// Cheap and non-invasive: this neither opens nor reserves the device, and can
+/// be read while another process (or this one) is capturing from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceStatus {
+    /// Input is locked to an SDI signal.
+    pub signal_locked: Option<bool>,
+    /// Locked to house reference (genlock).
+    pub reference_locked: Option<bool>,
+    /// Ancillary data stream is locked.
+    pub ancillary_locked: Option<bool>,
+    /// Device is held open by some process — including this one.
+    pub busy: Option<bool>,
+    /// Detected input raster as a DeckLink mode FourCC, e.g. `"Hi50"`.
+    /// `None` on an unlocked input.
+    pub detected_mode: Option<String>,
+    /// Detected colorimetry, e.g. `"r709"`.
+    pub detected_colorspace: Option<String>,
+    /// Detected field dominance, e.g. `"uppr"` (upper field first).
+    pub detected_field_dominance: Option<String>,
+    /// Detected SDI link configuration, e.g. `"lcsl"` (single link).
+    pub sdi_link_config: Option<String>,
+    /// Raster of the reference signal. `None` when no reference is connected
+    /// (the card reports `bmdModeUnknown` there, which is mapped away).
+    pub reference_mode: Option<String>,
+    /// `BMDDynamicRange`; `0` is SDR.
+    pub detected_dynamic_range: Option<i32>,
+    /// PCIe generation the card negotiated, e.g. `2`.
+    pub pcie_link_speed: Option<i32>,
+    /// PCIe lanes the card negotiated, e.g. `4`.
+    pub pcie_link_width: Option<i32>,
+}
+
+/// Read the hardware status of the device at `index`.
+///
+/// Does not open or reserve the device, so it is safe to call for every port on
+/// a card while flows are running — that is what makes a whole-card "which
+/// inputs have signal?" view possible.
+pub fn device_status(index: u32) -> Result<DeviceStatus> {
+    let mut raw = sys::dl_device_status::default();
+    let rc = unsafe { sys::dl_device_status_get(index as i32, &mut raw) };
+    match rc {
+        x if x == sys::DL_OK as i32 => {}
+        x if x == sys::DL_ERR_NO_DEVICE => {
+            return Err(Error::DeviceNotFound(format!("device index {index}")));
+        }
+        x if x == sys::DL_ERR_UNSUPPORTED => {
+            return Err(Error::Unsupported(
+                "device does not implement IDeckLinkStatus".into(),
+            ));
+        }
+        other => return Err(Error::Io(format!("dl_device_status_get failed: {other}"))),
+    }
+
+    Ok(DeviceStatus {
+        signal_locked: tri_to_bool(raw.signal_locked),
+        reference_locked: tri_to_bool(raw.reference_locked),
+        ancillary_locked: tri_to_bool(raw.ancillary_locked),
+        busy: tri_to_bool(raw.busy),
+        detected_mode: fourcc_to_string(raw.detected_mode),
+        detected_colorspace: fourcc_to_string(raw.detected_colorspace),
+        detected_field_dominance: fourcc_to_string(raw.detected_field_dominance),
+        sdi_link_config: fourcc_to_string(raw.sdi_link_config),
+        reference_mode: fourcc_to_string(raw.reference_mode),
+        detected_dynamic_range: (raw.detected_dynamic_range >= 0)
+            .then_some(raw.detected_dynamic_range),
+        pcie_link_speed: (raw.pcie_link_speed >= 0).then_some(raw.pcie_link_speed),
+        pcie_link_width: (raw.pcie_link_width >= 0).then_some(raw.pcie_link_width),
+    })
+}
+
 /// Enumerate the DeckLink devices on this host.
 ///
 /// Returns an empty vec when Desktop Video is not installed or no card is
@@ -484,12 +602,35 @@ impl DecklinkPlayout {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_sdi_channel;
+    use super::{fourcc_to_string, parse_sdi_channel, tri_to_bool};
 
     #[test]
     fn parses_connector_index() {
         assert_eq!(parse_sdi_channel("DeckLink Quad (3)"), Some(3));
         assert_eq!(parse_sdi_channel("DeckLink Duo 2"), None);
         assert_eq!(parse_sdi_channel("Weird (x)"), None);
+    }
+
+    #[test]
+    fn decodes_status_fourcc() {
+        // Values observed from a DeckLink Quad 2 on a live 1080i50 source.
+        assert_eq!(fourcc_to_string(1_214_854_448).as_deref(), Some("Hi50"));
+        assert_eq!(fourcc_to_string(1_916_219_449).as_deref(), Some("r709"));
+        assert_eq!(fourcc_to_string(1_818_456_940).as_deref(), Some("lcsl"));
+        // Zero is the "card declined to answer" sentinel, not a mode.
+        assert_eq!(fourcc_to_string(0), None);
+        // Non-printable bytes must not reach the operator as mojibake.
+        assert_eq!(fourcc_to_string(1), None);
+        // Modes shorter than 4 chars are space-padded by the SDK ("pal ").
+        assert_eq!(fourcc_to_string(0x7061_6C20).as_deref(), Some("pal"));
+        // `bmdModeUnknown` ('iunk') is the card saying nothing, not a raster.
+        assert_eq!(fourcc_to_string(0x6975_6E6B), None);
+    }
+
+    #[test]
+    fn tri_state_never_confuses_unknown_with_false() {
+        assert_eq!(tri_to_bool(1), Some(true));
+        assert_eq!(tri_to_bool(0), Some(false));
+        assert_eq!(tri_to_bool(-1), None);
     }
 }

@@ -50,6 +50,11 @@ config, and the upstream bugs found during bring-up.
 
 * `enumerate_devices` and `DecklinkCapture` — implemented, verified on a
   DeckLink Quad 2 against a live 1080i50 source.
+* `device_status` — read-only `IDeckLinkStatus` snapshot (signal lock, genlock /
+  reference lock, detected raster + colorimetry + field dominance, SDI link
+  configuration, PCIe link speed/width, busy). Opens nothing, so it works on
+  every port of a card while flows are running. Every field is `Option`: the
+  card answers per-field and "unknown" is never rendered as "no".
 * `DecklinkPlayout` — not implemented; returns `Error::Unsupported` (never
   panics: this crate is linked into a long-running broadcast binary).
 

@@ -316,6 +316,108 @@ int32_t dl_device_name(int32_t index, char *buf, size_t buf_len) {
     return rc;
 }
 
+/* Read one tri-state flag, leaving the field "unknown" when the card declines.
+ * Every field is independent: a device answers some and not others depending
+ * on model and on whether an input is currently locked. */
+static void status_flag(IDeckLinkStatus *st, BMDDeckLinkStatusID id,
+                        int32_t *out) {
+    bool v = false;
+    *out = (st->GetFlag(id, &v) == S_OK) ? (v ? 1 : 0) : DL_STATUS_UNKNOWN_TRI;
+}
+
+static void status_fourcc(IDeckLinkStatus *st, BMDDeckLinkStatusID id,
+                          int64_t *out) {
+    int64_t v = 0;
+    *out = (st->GetInt(id, &v) == S_OK) ? v : DL_STATUS_UNKNOWN_FCC;
+}
+
+static void status_int32(IDeckLinkStatus *st, BMDDeckLinkStatusID id,
+                         int32_t *out) {
+    int64_t v = 0;
+    *out = (st->GetInt(id, &v) == S_OK) ? (int32_t)v : DL_STATUS_UNKNOWN_TRI;
+}
+
+int32_t dl_device_status_get(int32_t index, dl_device_status *out) {
+    if (!out || index < 0)
+        return DL_ERR_PARAM;
+
+    /* Start fully "unknown" so an early return never reports a confident
+     * false. A caller must not be able to mistake "not asked" for "not
+     * locked" — that is the whole bug this crate exists to avoid. */
+    out->signal_locked = DL_STATUS_UNKNOWN_TRI;
+    out->reference_locked = DL_STATUS_UNKNOWN_TRI;
+    out->ancillary_locked = DL_STATUS_UNKNOWN_TRI;
+    out->busy = DL_STATUS_UNKNOWN_TRI;
+    out->detected_mode = DL_STATUS_UNKNOWN_FCC;
+    out->detected_colorspace = DL_STATUS_UNKNOWN_FCC;
+    out->detected_field_dominance = DL_STATUS_UNKNOWN_FCC;
+    out->sdi_link_config = DL_STATUS_UNKNOWN_FCC;
+    out->reference_mode = DL_STATUS_UNKNOWN_FCC;
+    out->detected_dynamic_range = DL_STATUS_UNKNOWN_TRI;
+    out->pcie_link_speed = DL_STATUS_UNKNOWN_TRI;
+    out->pcie_link_width = DL_STATUS_UNKNOWN_TRI;
+
+    IDeckLinkIterator *iter = CreateDeckLinkIteratorInstance();
+    if (!iter)
+        return DL_ERR_NO_DEVICE;
+
+    int32_t i = 0;
+    int32_t rc = DL_ERR_NO_DEVICE;
+    IDeckLink *dev = nullptr;
+    while (iter->Next(&dev) == S_OK) {
+        if (i != index) {
+            dev->Release();
+            ++i;
+            continue;
+        }
+
+        IDeckLinkStatus *st = nullptr;
+        if (dev->QueryInterface(IID_IDeckLinkStatus, (void **)&st) == S_OK) {
+            status_flag(st, bmdDeckLinkStatusVideoInputSignalLocked,
+                        &out->signal_locked);
+            status_flag(st, bmdDeckLinkStatusReferenceSignalLocked,
+                        &out->reference_locked);
+            status_flag(st, bmdDeckLinkStatusAncillaryInputSignalLocked,
+                        &out->ancillary_locked);
+
+            /* Busy is an int bitfield (BMDDeviceBusyState), not a flag —
+             * non-zero means some process holds the device, ourselves
+             * included. */
+            int64_t busy = 0;
+            out->busy = (st->GetInt(bmdDeckLinkStatusBusy, &busy) == S_OK)
+                            ? (busy != 0 ? 1 : 0)
+                            : DL_STATUS_UNKNOWN_TRI;
+
+            status_fourcc(st, bmdDeckLinkStatusDetectedVideoInputMode,
+                          &out->detected_mode);
+            status_fourcc(st, bmdDeckLinkStatusDetectedVideoInputColorspace,
+                          &out->detected_colorspace);
+            status_fourcc(st, bmdDeckLinkStatusDetectedVideoInputFieldDominance,
+                          &out->detected_field_dominance);
+            status_fourcc(st, bmdDeckLinkStatusDetectedSDILinkConfiguration,
+                          &out->sdi_link_config);
+            status_fourcc(st, bmdDeckLinkStatusReferenceSignalMode,
+                          &out->reference_mode);
+
+            status_int32(st, bmdDeckLinkStatusDetectedVideoInputDynamicRange,
+                         &out->detected_dynamic_range);
+            status_int32(st, bmdDeckLinkStatusPCIExpressLinkSpeed,
+                         &out->pcie_link_speed);
+            status_int32(st, bmdDeckLinkStatusPCIExpressLinkWidth,
+                         &out->pcie_link_width);
+
+            st->Release();
+            rc = DL_OK;
+        } else {
+            rc = DL_ERR_UNSUPPORTED;
+        }
+        dev->Release();
+        break;
+    }
+    iter->Release();
+    return rc;
+}
+
 int32_t dl_open(const char *device, const char *mode, int32_t pixel_format,
                 int32_t audio_channels, dl_capture **out) {
     if (!out)

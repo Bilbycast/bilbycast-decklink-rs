@@ -11,7 +11,7 @@ Blackmagic DeckLink SDK directly. Used only when bilbycast-edge is built with
 | Crate | Role |
 |-------|------|
 | **libdecklink-sys** | `shim/decklink_shim.{h,cpp}` — a C++ shim exposing a C ABI over the SDK — plus bindgen FFI for it. Compiled with `cc` together with the SDK's `DeckLinkAPIDispatch.cpp`. |
-| **decklink-rs** | Safe wrapper: `enumerate_devices`, `DecklinkCapture`, and the `Captured*` / `Decklink*Config` types. The crate bilbycast-edge depends on. |
+| **decklink-rs** | Safe wrapper: `enumerate_devices`, `device_status`, `DecklinkCapture`, and the `Captured*` / `Decklink*Config` types. The crate bilbycast-edge depends on. |
 
 ## Why the SDK, not FFmpeg's `decklink` avdevice
 
@@ -74,6 +74,30 @@ runtime (kernel driver + `libDeckLinkAPI.so`).
 * **Signal loss does not stop the stream.** The card keeps delivering frames with
   `bmdFrameHasNoInputSource` set. Callers should keep encoding (holding the
   transport stream up is what downstream wants) and raise an alarm.
+* **`IDeckLinkStatus` needs no open handle.** `device_status(index)` neither
+  opens nor reserves the device, and reads correctly while another process is
+  capturing from it (`busy` reports `true`). That is what makes a whole-card
+  "which ports have signal?" view possible without disturbing live flows.
+* **The card answers per-field, and says "unknown" a lot.** On an unlocked input
+  every `Detected*` field returns `E_FAIL`, so each maps to `Option`. Never
+  render a missing answer as `false`.
+* **Two traps in the status API.** `CurrentVideoInputMode` returns a bogus
+  `'ntsc'` default on an unlocked port instead of failing, so it is deliberately
+  *not* exposed — `DetectedVideoInputMode` is the honest one. And several
+  fields return `bmdModeUnknown` (`'iunk'`) rather than an error;
+  `fourcc_to_string` maps that to `None`.
+
+Observed on a DeckLink Quad 2 (locked 1080i50 on port 1, ports 2–8 idle):
+
+```
+[0] signal=yes reference=no anc=yes busy=no
+    mode=Hi50 colorspace=r709 field=uppr link=lcsl  pcie=gen2 x4
+[1] signal=no  reference=no anc=no  busy=no
+    mode=—    colorspace=—    field=—    link=—     pcie=gen2 x4
+```
+
+`reference=no` on every port: no house reference is patched to this card.
+Ethernet/HDMI status IDs belong to the IP and HDMI models and are not exposed.
 
 ## Known-good bilbycast-edge SDI config
 
