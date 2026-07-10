@@ -29,6 +29,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-env-changed=DECKLINK_SDK_DIR");
     println!("cargo:rerun-if-changed=shim/decklink_shim.cpp");
+    println!("cargo:rerun-if-changed=shim/decklink_shim_playout.cpp");
     println!("cargo:rerun-if-changed=shim/decklink_shim.h");
 
     let sdk = env::var("DECKLINK_SDK_DIR").unwrap_or_else(|_| {
@@ -57,6 +58,7 @@ fn main() {
         .include(&sdk)
         .include("shim")
         .file("shim/decklink_shim.cpp")
+        .file("shim/decklink_shim_playout.cpp")
         .file(&dispatch)
         // The SDK headers trip these; they are not our code to fix.
         .flag_if_supported("-Wno-unused-parameter")

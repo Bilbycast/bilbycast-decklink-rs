@@ -135,6 +135,42 @@ uint64_t dl_dropped_frames(const dl_capture *cap);
 
 void dl_close(dl_capture *cap);
 
+/* ── playout ──────────────────────────────────────────────────────────── */
+/*
+ * Scheduled video playout. The shim owns the SDK's completion callback and a
+ * small in-flight window: `dl_playout_write_video` blocks while
+ * DL_PLAYOUT_MAX_INFLIGHT frames are scheduled and un-completed, so the
+ * caller's pace is governed by the card's clock. Playback starts
+ * automatically once DL_PLAYOUT_PREROLL frames are queued.
+ *
+ * Video only for now. `mode` must be an explicit DeckLink 4CC ("Hi50",
+ * "Hp25", ...) — playout has nothing to auto-detect from.
+ */
+#define DL_PLAYOUT_PREROLL 3
+#define DL_PLAYOUT_MAX_INFLIGHT 8
+
+typedef struct dl_playout dl_playout;
+
+int32_t dl_playout_open(const char *device, const char *mode,
+                        int32_t pixel_format, dl_playout **out);
+
+/* Frame geometry the card expects. `data` passed to write_video must be
+ * exactly `row_bytes * height` bytes of the opened pixel format. */
+int32_t dl_playout_info(const dl_playout *po, int32_t *width, int32_t *height,
+                        int32_t *row_bytes, int64_t *fr_num, int64_t *fr_den);
+
+/* Copies `size` bytes into a card frame and schedules it after the previous
+ * one. Blocks while the in-flight window is full. DL_ERR_STOPPED after
+ * dl_playout_close, DL_ERR_PARAM on a size mismatch. */
+int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size);
+
+/* Frames the card reported as displayed late (caller fell behind the SDI
+ * cadence) / dropped. Cumulative. */
+uint64_t dl_playout_late_frames(const dl_playout *po);
+uint64_t dl_playout_dropped_frames(const dl_playout *po);
+
+void dl_playout_close(dl_playout *po);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

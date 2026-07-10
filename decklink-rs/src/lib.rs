@@ -567,36 +567,172 @@ pub struct DecklinkPlayoutConfig {
     pub audio_sample_rate: u32,
 }
 
-/// Error text returned by every not-yet-implemented [`DecklinkPlayout`] method.
-const PLAYOUT_UNIMPLEMENTED: &str =
-    "SDI playout (DecklinkPlayout) is not implemented yet; only capture is supported";
-
-/// Live SDI playout handle.
+/// Live SDI playout handle (video only today).
 ///
-/// **Not implemented yet** — every constructor returns [`Error::Unsupported`],
-/// so this type is never instantiated today.
-#[allow(dead_code)]
+/// Frames are *scheduled* against the card's clock: `write_video` copies the
+/// frame into card memory and queues it after the previous one; playback
+/// starts automatically once a small pre-roll is queued, and the call blocks
+/// while the in-flight window is full — so the card's cadence paces the
+/// caller. Drive it from a blocking thread, exactly like
+/// [`DecklinkCapture::read_frame`].
 pub struct DecklinkPlayout {
-    _cfg: DecklinkPlayoutConfig,
+    po: *mut sys::dl_playout,
+    device: String,
+    width: u32,
+    height: u32,
+    row_bytes: usize,
+    fr_num: u32,
+    fr_den: u32,
 }
 
+// SAFETY: the shim guards its internal state with a mutex; the handle is
+// moved between threads but only used behind `&mut` (Send, not Sync) — the
+// same contract as `DecklinkCapture`.
+unsafe impl Send for DecklinkPlayout {}
+
 impl DecklinkPlayout {
-    /// **Not implemented yet** — returns [`Error::Unsupported`].
+    /// Open the device for scheduled playout at `cfg.format` (an explicit
+    /// DeckLink mode FourCC such as `"Hi50"` — playout has nothing to
+    /// auto-detect from).
     ///
-    /// Deliberately an `Err` rather than `todo!()`: this crate is linked into a
-    /// long-running broadcast binary, where a panic would take down the process.
-    pub fn open(_cfg: DecklinkPlayoutConfig) -> Result<Self> {
-        Err(Error::Unsupported(PLAYOUT_UNIMPLEMENTED.to_string()))
+    /// When `cfg.width` / `cfg.height` are non-zero they are validated against
+    /// the mode's raster, so a caller that already decoded video learns about
+    /// a mode/content mismatch here rather than as a garbled picture.
+    pub fn open(cfg: DecklinkPlayoutConfig) -> Result<Self> {
+        if cfg.pixel_format == DecklinkPixelFormat::V210 {
+            return Err(Error::Unsupported(
+                "v210 (10-bit) playout is not implemented yet; use uyvy422".into(),
+            ));
+        }
+        let device_c = CString::new(cfg.device.as_str())
+            .map_err(|_| Error::OpenFailed("device name contains NUL".into()))?;
+        let mode_c = CString::new(cfg.format.as_str())
+            .map_err(|_| Error::OpenFailed("mode contains NUL".into()))?;
+
+        let mut po: *mut sys::dl_playout = std::ptr::null_mut();
+        let rc = unsafe {
+            sys::dl_playout_open(
+                device_c.as_ptr(),
+                mode_c.as_ptr(),
+                sys::DL_PIXFMT_UYVY422 as i32,
+                &mut po,
+            )
+        };
+        match rc {
+            x if x == sys::DL_OK as i32 => {}
+            x if x == sys::DL_ERR_NO_DEVICE => {
+                return Err(Error::DeviceNotFound(cfg.device.clone()));
+            }
+            x if x == sys::DL_ERR_UNSUPPORTED => {
+                return Err(Error::Unsupported(format!(
+                    "device '{}' does not support playout of mode '{}' at uyvy422",
+                    cfg.device, cfg.format
+                )));
+            }
+            x if x == sys::DL_ERR_PARAM => {
+                return Err(Error::OpenFailed(format!(
+                    "invalid playout mode '{}' (must be a 4-char DeckLink mode FourCC)",
+                    cfg.format
+                )));
+            }
+            other => {
+                return Err(Error::OpenFailed(format!(
+                    "dl_playout_open failed: {other}"
+                )));
+            }
+        }
+
+        let (mut w, mut h, mut rb) = (0i32, 0i32, 0i32);
+        let (mut num, mut den) = (0i64, 0i64);
+        unsafe { sys::dl_playout_info(po, &mut w, &mut h, &mut rb, &mut num, &mut den) };
+
+        let out = Self {
+            po,
+            device: cfg.device.clone(),
+            width: w as u32,
+            height: h as u32,
+            row_bytes: rb as usize,
+            fr_num: num as u32,
+            fr_den: den.max(1) as u32,
+        };
+
+        if (cfg.width != 0 && cfg.width != out.width)
+            || (cfg.height != 0 && cfg.height != out.height)
+        {
+            return Err(Error::Unsupported(format!(
+                "mode '{}' is {}x{} but the caller's video is {}x{} — pick the \
+                 mode matching the content",
+                cfg.format, out.width, out.height, cfg.width, cfg.height
+            )));
+        }
+        Ok(out)
     }
 
-    /// **Not implemented yet** — returns [`Error::Unsupported`].
-    pub fn write_video(&mut self, _data: &[u8], _pts: i64) -> Result<()> {
-        Err(Error::Unsupported(PLAYOUT_UNIMPLEMENTED.to_string()))
+    /// Raster of the opened mode.
+    pub fn video_dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
-    /// **Not implemented yet** — returns [`Error::Unsupported`].
+    /// Frame rate of the opened mode, e.g. `(25000, 1000)`.
+    pub fn video_frame_rate(&self) -> (u32, u32) {
+        (self.fr_num, self.fr_den)
+    }
+
+    /// Bytes per row the card expects; a frame is `row_bytes() * height`.
+    pub fn row_bytes(&self) -> usize {
+        self.row_bytes
+    }
+
+    /// Schedule one UYVY422 frame. `data` must be exactly
+    /// `row_bytes() * height` bytes. Blocks while the in-flight window is
+    /// full — the card's clock paces the caller.
+    pub fn write_video(&mut self, data: &[u8]) -> Result<()> {
+        let rc = unsafe { sys::dl_playout_write_video(self.po, data.as_ptr(), data.len()) };
+        match rc {
+            x if x == sys::DL_OK as i32 => Ok(()),
+            x if x == sys::DL_ERR_STOPPED => Err(Error::Eof),
+            x if x == sys::DL_ERR_PARAM => Err(Error::Io(format!(
+                "frame size mismatch: got {} bytes, mode wants {} ({}x{} rows)",
+                data.len(),
+                self.row_bytes * self.height as usize,
+                self.row_bytes,
+                self.height,
+            ))),
+            other => Err(Error::Io(format!(
+                "playout write failed on '{}': {other}",
+                self.device
+            ))),
+        }
+    }
+
+    /// Frames the card reported as displayed late — the caller fell behind
+    /// the SDI cadence. Cumulative.
+    pub fn late_frames(&self) -> u64 {
+        unsafe { sys::dl_playout_late_frames(self.po) }
+    }
+
+    /// Frames the card dropped outright. Cumulative.
+    pub fn dropped_frames(&self) -> u64 {
+        unsafe { sys::dl_playout_dropped_frames(self.po) }
+    }
+
+    /// **Not implemented yet** — returns [`Error::Unsupported`]. Video-only
+    /// playout ships first; audio scheduling joins once the video path is
+    /// loopback-verified. Deliberately an `Err` rather than `todo!()`: this
+    /// crate links into a long-running broadcast binary.
     pub fn write_audio(&mut self, _samples: &[i32], _pts: i64) -> Result<()> {
-        Err(Error::Unsupported(PLAYOUT_UNIMPLEMENTED.to_string()))
+        Err(Error::Unsupported(
+            "SDI playout audio is not implemented yet; video-only".into(),
+        ))
+    }
+}
+
+impl Drop for DecklinkPlayout {
+    fn drop(&mut self) {
+        if !self.po.is_null() {
+            unsafe { sys::dl_playout_close(self.po) };
+            self.po = std::ptr::null_mut();
+        }
     }
 }
 
