@@ -1,7 +1,7 @@
 # bilbycast-decklink-rs
 
-Safe Rust SDI **capture** for **Blackmagic DeckLink** cards, talking to the
-Blackmagic DeckLink SDK directly. Backs
+Safe Rust SDI **capture and playout** for **Blackmagic DeckLink** cards,
+talking to the Blackmagic DeckLink SDK directly. Backs
 [bilbycast-edge](https://github.com/Bilbycast/bilbycast-edge)'s `sdi-decklink`
 feature (off by default), targeting upstream issue
 [#19](https://github.com/Bilbycast/bilbycast-edge/issues/19).
@@ -9,8 +9,9 @@ feature (off by default), targeting upstream issue
 ```
 bilbycast-decklink-rs/
 ├── libdecklink-sys/   C++ shim exposing a C ABI over the SDK, + bindgen FFI
-│   └── shim/          decklink_shim.{h,cpp}
-└── decklink-rs/       safe wrapper: DecklinkCapture, enumerate_devices
+│   └── shim/          decklink_shim.{h,cpp}, decklink_shim_playout.cpp
+└── decklink-rs/       safe wrapper: DecklinkCapture, DecklinkPlayout,
+                       device_status, enumerate_devices
 ```
 
 ## Why the SDK and not FFmpeg's `decklink` avdevice
@@ -55,8 +56,16 @@ config, and the upstream bugs found during bring-up.
   configuration, PCIe link speed/width, busy). Opens nothing, so it works on
   every port of a card while flows are running. Every field is `Option`: the
   card answers per-field and "unknown" is never rendered as "no".
-* `DecklinkPlayout` — not implemented; returns `Error::Unsupported` (never
-  panics: this crate is linked into a long-running broadcast binary).
+* `DecklinkPlayout` — scheduled **video playout** against the card's clock
+  (3-frame pre-roll, completion-callback-paced in-flight window, late/dropped
+  counters). Verified by physical BNC loopback: bars out one sub-device,
+  captured on the looped port, photographed — correct colours, live motion,
+  `late=0 dropped=0`. Audio playout not yet implemented — `write_audio`
+  returns `Error::Unsupported` (never panics: this crate is linked into a
+  long-running broadcast binary).
+
+On 8-port Quad cards the physical→software connector mapping interleaves and
+sub-device pairs share connectors — see CLAUDE.md before touching a rack.
 
 ## License
 
