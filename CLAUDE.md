@@ -99,6 +99,33 @@ Observed on a DeckLink Quad 2 (locked 1080i50 on port 1, ports 2–8 idle):
 `reference=no` on every port: no house reference is patched to this card.
 Ethernet/HDMI status IDs belong to the IP and HDMI models and are not exposed.
 
+## Physical connector ↔ software device mapping (8-port Quad cards)
+
+Software numbering **interleaves** across the physical connectors. Counting
+physical SDI ports from the REF/genlock BNC outward (per Blackmagic's Desktop
+Video Utility diagram, verified empirically on this card):
+
+| physical | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|----------|---|---|---|---|---|---|---|---|
+| software | 1 | 5 | 2 | 6 | 3 | 7 | 4 | 8 |
+
+Sub-devices pair as (1,5), (2,6), (3,7), (4,8) — each pair shares two
+*adjacent* physical connectors. The pairing is live routing, not trivia:
+**when a sub-device plays out while its own connector is carrying an input,
+the output emerges on its pair partner's connector.** Verified: playout on
+"DeckLink Quad (1)" while its connector held a live input emerged on physical
+port 2 (= software 5's connector) — a loop from physical 2 to physical 3 then
+arrives at "DeckLink Quad (2)".
+
+Also observed: **idle outputs emit NTSC black** — a looped-back input shows
+`signal=yes, mode=ntsc` with nothing deliberately playing. Do not read a
+looped port's bare `signal_locked` as proof your playout works; check
+`detected_mode` matches the mode you scheduled.
+
+Playout itself was verified photographically: bars scheduled on one
+sub-device, captured on the looped pair connector, correct colours and a
+moving element confirming live video (`examples/playout_bars.rs`).
+
 ## Known-good bilbycast-edge SDI config
 
 Verified on bilby-z440 (live 1080i50 source → NVENC → SRT: correct colours,
