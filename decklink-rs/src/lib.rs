@@ -83,6 +83,13 @@ pub enum Error {
     /// A requested pixel format / mode this build does not map.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// Playout backpressure: the card's scheduled-frame queue is full and did
+    /// not drain within the write timeout (the card is behind the SDI cadence,
+    /// or wedged with playback running but not draining). The frame was not
+    /// scheduled. Callers should drop the frame and retry — re-checking their
+    /// own cancellation — rather than treat the device as failed.
+    #[error("playout busy: scheduled-frame queue full")]
+    Busy,
     /// The capture was closed.
     #[error("decklink stream ended")]
     Eof,
@@ -685,11 +692,14 @@ impl DecklinkPlayout {
 
     /// Schedule one UYVY422 frame. `data` must be exactly
     /// `row_bytes() * height` bytes. Blocks while the in-flight window is
-    /// full — the card's clock paces the caller.
+    /// full — the card's clock paces the caller — but only up to a bounded
+    /// timeout: if the card stops draining it returns [`Error::Busy`] instead
+    /// of blocking forever, so a caller can re-check its own cancellation.
     pub fn write_video(&mut self, data: &[u8]) -> Result<()> {
         let rc = unsafe { sys::dl_playout_write_video(self.po, data.as_ptr(), data.len()) };
         match rc {
             x if x == sys::DL_OK as i32 => Ok(()),
+            x if x == sys::DL_TIMEOUT as i32 => Err(Error::Busy),
             x if x == sys::DL_ERR_STOPPED => Err(Error::Eof),
             x if x == sys::DL_ERR_PARAM => Err(Error::Io(format!(
                 "frame size mismatch: got {} bytes, mode wants {} ({}x{} rows)",

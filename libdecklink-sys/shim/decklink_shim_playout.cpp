@@ -12,6 +12,7 @@
 #include "DeckLinkAPI.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -248,14 +249,21 @@ int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size)
     if (size != (size_t)po->row_bytes * (size_t)po->height)
         return DL_ERR_PARAM;
 
-    // Backpressure: the card's completion callbacks pace the writer.
+    // Backpressure: the card's completion callbacks pace the writer. The wait
+    // is BOUNDED so a wedged card (playback running but not draining — e.g.
+    // reference/genlock lost) cannot pin this thread forever. On timeout the
+    // frame is not scheduled and DL_TIMEOUT is returned, so the caller regains
+    // control and can re-check its own cancellation before trying again.
     {
         std::unique_lock<std::mutex> lk(po->mu);
-        po->cv.wait(lk, [po] {
-            return po->stopping || po->in_flight < DL_PLAYOUT_MAX_INFLIGHT;
-        });
+        const bool ready = po->cv.wait_for(
+            lk, std::chrono::milliseconds(500), [po] {
+                return po->stopping || po->in_flight < DL_PLAYOUT_MAX_INFLIGHT;
+            });
         if (po->stopping)
             return DL_ERR_STOPPED;
+        if (!ready)
+            return DL_TIMEOUT; // queue still full — frame not scheduled
         po->in_flight++;
     }
 
