@@ -143,16 +143,25 @@ void dl_close(dl_capture *cap);
  * caller's pace is governed by the card's clock. Playback starts
  * automatically once DL_PLAYOUT_PREROLL frames are queued.
  *
- * Video only for now. `mode` must be an explicit DeckLink 4CC ("Hi50",
- * "Hp25", ...) — playout has nothing to auto-detect from.
+ * `mode` must be an explicit DeckLink 4CC ("Hi50", "Hp25", ...) — playout has
+ * nothing to auto-detect from.
+ *
+ * Audio (optional): when `audio_channels` > 0 the device is opened with
+ * timestamped scheduled audio at 48 kHz, 32-bit signed interleaved. Audio
+ * samples are scheduled on the SAME 90 kHz timeline as video (shared
+ * StartScheduledPlayback), so a caller that supplies each block's stream time
+ * as `audio_pts_90k - first_video_pts_90k` gets hardware A/V sync.
  */
 #define DL_PLAYOUT_PREROLL 3
 #define DL_PLAYOUT_MAX_INFLIGHT 8
 
 typedef struct dl_playout dl_playout;
 
+/* `audio_channels` - 0 disables audio; otherwise 2, 8 or 16. Audio is always
+ * 48 kHz, 32-bit signed integer, interleaved. */
 int32_t dl_playout_open(const char *device, const char *mode,
-                        int32_t pixel_format, dl_playout **out);
+                        int32_t pixel_format, int32_t audio_channels,
+                        dl_playout **out);
 
 /* Frame geometry the card expects. `data` passed to write_video must be
  * exactly `row_bytes * height` bytes of the opened pixel format. */
@@ -160,9 +169,18 @@ int32_t dl_playout_info(const dl_playout *po, int32_t *width, int32_t *height,
                         int32_t *row_bytes, int64_t *fr_num, int64_t *fr_den);
 
 /* Copies `size` bytes into a card frame and schedules it after the previous
- * one. Blocks while the in-flight window is full. DL_ERR_STOPPED after
- * dl_playout_close, DL_ERR_PARAM on a size mismatch. */
+ * one. Blocks (bounded) while the in-flight window is full. DL_ERR_STOPPED
+ * after dl_playout_close, DL_TIMEOUT if the card stops draining, DL_ERR_PARAM
+ * on a size mismatch. */
 int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size);
+
+/* Schedule one block of interleaved 32-bit signed audio at `stream_time_90k`
+ * on the shared 90 kHz playout timeline. `samples` holds
+ * `sample_frames * channels` int32 values. Non-blocking. DL_ERR_UNSUPPORTED
+ * if the device was opened with audio_channels == 0; DL_ERR_STOPPED after
+ * close. */
+int32_t dl_playout_write_audio(dl_playout *po, const int32_t *samples,
+                               int32_t sample_frames, int64_t stream_time_90k);
 
 /* Frames the card reported as displayed late (caller fell behind the SDI
  * cadence) / dropped. Cumulative. */

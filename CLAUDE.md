@@ -89,6 +89,14 @@ runtime (kernel driver + `libDeckLinkAPI.so`).
   a 3-frame pre-roll. Writing pixels into a `CreateVideoFrame` frame needs
   the same `IDeckLinkVideoBuffer` dance as capture, with
   `bmdBufferAccessWrite`.
+* **Playout audio is timestamped for A/V sync.** `EnableAudioOutput` with
+  `bmdAudioOutputStreamTimestamped` at 48 kHz / 32-bit; each block is
+  scheduled with an explicit stream time on the SAME 90 kHz timeline as
+  video. The caller passes `audio_pts - first_video_pts` so the card
+  lip-syncs. At startup the first block(s) can land in the past (video
+  preroll already began playback) and are dropped — dropping past audio
+  keeps sync, so the caller must not treat pre-first-success failures as
+  errors.
 * **Two traps in the status API.** `CurrentVideoInputMode` returns a bogus
   `'ntsc'` default on an unlocked port instead of failing, so it is deliberately
   *not* exposed — `DetectedVideoInputMode` is the honest one. And several

@@ -56,13 +56,13 @@ config, and the upstream bugs found during bring-up.
   configuration, PCIe link speed/width, busy). Opens nothing, so it works on
   every port of a card while flows are running. Every field is `Option`: the
   card answers per-field and "unknown" is never rendered as "no".
-* `DecklinkPlayout` — scheduled **video playout** against the card's clock
-  (3-frame pre-roll, completion-callback-paced in-flight window, late/dropped
-  counters). Verified by physical BNC loopback: bars out one sub-device,
-  captured on the looped port, photographed — correct colours, live motion,
-  `late=0 dropped=0`. Audio playout not yet implemented — `write_audio`
-  returns `Error::Unsupported` (never panics: this crate is linked into a
-  long-running broadcast binary).
+* `DecklinkPlayout` — scheduled **video + audio playout** against the card's
+  clock (3-frame pre-roll, completion-callback-paced in-flight window,
+  late/dropped counters). Audio is 48 kHz 32-bit interleaved, scheduled
+  timestamped on the shared 90 kHz timeline so a caller supplying
+  `audio_pts - first_video_pts` gets hardware A/V sync. Verified by physical
+  BNC loopback: bars/video out one sub-device, captured on the looped port —
+  correct colours, live motion, continuous audio, `late=0 dropped=0`.
 
 On 8-port Quad cards the physical→software connector mapping interleaves and
 sub-device pairs share connectors — see CLAUDE.md before touching a rack.

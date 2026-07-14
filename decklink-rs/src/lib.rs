@@ -590,6 +590,9 @@ pub struct DecklinkPlayout {
     row_bytes: usize,
     fr_num: u32,
     fr_den: u32,
+    /// Interleaved audio channel count the device was opened with; 0 = no
+    /// audio. Audio is always 48 kHz, 32-bit signed.
+    audio_channels: u8,
 }
 
 // SAFETY: the shim guards its internal state with a mutex; the handle is
@@ -616,12 +619,19 @@ impl DecklinkPlayout {
         let mode_c = CString::new(cfg.format.as_str())
             .map_err(|_| Error::OpenFailed("mode contains NUL".into()))?;
 
+        if !matches!(cfg.audio_channels, 0 | 2 | 8 | 16) {
+            return Err(Error::Unsupported(format!(
+                "audio_channels must be 0, 2, 8 or 16 (got {})",
+                cfg.audio_channels
+            )));
+        }
         let mut po: *mut sys::dl_playout = std::ptr::null_mut();
         let rc = unsafe {
             sys::dl_playout_open(
                 device_c.as_ptr(),
                 mode_c.as_ptr(),
                 sys::DL_PIXFMT_UYVY422 as i32,
+                cfg.audio_channels as i32,
                 &mut po,
             )
         };
@@ -661,6 +671,7 @@ impl DecklinkPlayout {
             row_bytes: rb as usize,
             fr_num: num as u32,
             fr_den: den.max(1) as u32,
+            audio_channels: cfg.audio_channels,
         };
 
         if (cfg.width != 0 && cfg.width != out.width)
@@ -726,14 +737,48 @@ impl DecklinkPlayout {
         unsafe { sys::dl_playout_dropped_frames(self.po) }
     }
 
-    /// **Not implemented yet** — returns [`Error::Unsupported`]. Video-only
-    /// playout ships first; audio scheduling joins once the video path is
-    /// loopback-verified. Deliberately an `Err` rather than `todo!()`: this
-    /// crate links into a long-running broadcast binary.
-    pub fn write_audio(&mut self, _samples: &[i32], _pts: i64) -> Result<()> {
-        Err(Error::Unsupported(
-            "SDI playout audio is not implemented yet; video-only".into(),
-        ))
+    /// Interleaved audio channel count the device was opened with (0 = audio
+    /// disabled). Audio is always 48 kHz, 32-bit signed.
+    pub fn audio_channels(&self) -> u8 {
+        self.audio_channels
+    }
+
+    /// Schedule one block of interleaved 32-bit signed audio at
+    /// `stream_time_90k` on the shared 90 kHz playout timeline. `samples` holds
+    /// `frames * audio_channels()` values (channel-interleaved). Pass the
+    /// block's `source_pts_90k - first_video_pts_90k` as `stream_time_90k` so
+    /// the card lip-syncs it to video under the shared playback clock.
+    ///
+    /// Non-blocking. Returns [`Error::Unsupported`] if the device was opened
+    /// with `audio_channels == 0`, [`Error::Eof`] after the playout is closed.
+    pub fn write_audio(&mut self, samples: &[i32], stream_time_90k: i64) -> Result<()> {
+        if self.audio_channels == 0 {
+            return Err(Error::Unsupported(
+                "playout was opened without audio (audio_channels == 0)".into(),
+            ));
+        }
+        let ch = self.audio_channels as usize;
+        if samples.is_empty() || !samples.len().is_multiple_of(ch) {
+            return Err(Error::Io(format!(
+                "audio block of {} values is not a whole number of {ch}-channel frames",
+                samples.len()
+            )));
+        }
+        let sample_frames = (samples.len() / ch) as i32;
+        let rc = unsafe {
+            sys::dl_playout_write_audio(self.po, samples.as_ptr(), sample_frames, stream_time_90k)
+        };
+        match rc {
+            x if x == sys::DL_OK as i32 => Ok(()),
+            x if x == sys::DL_ERR_STOPPED => Err(Error::Eof),
+            x if x == sys::DL_ERR_UNSUPPORTED => Err(Error::Unsupported(
+                "playout audio not enabled".into(),
+            )),
+            other => Err(Error::Io(format!(
+                "playout audio write failed on '{}': {other}",
+                self.device
+            ))),
+        }
     }
 }
 

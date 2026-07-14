@@ -78,6 +78,8 @@ struct dl_playout {
     int32_t row_bytes = 0;
     BMDPixelFormat pixfmt = bmdFormat8BitYUV;
 
+    int32_t audio_channels = 0; // 0 == audio disabled
+
     // Schedule clock: each frame plays for `frame_duration` kTimeScale ticks.
     BMDTimeValue frame_duration = 0;
     BMDTimeValue next_time = 0;
@@ -149,8 +151,12 @@ private:
 extern "C" {
 
 int32_t dl_playout_open(const char *device, const char *mode,
-                        int32_t pixel_format, dl_playout **out) {
+                        int32_t pixel_format, int32_t audio_channels,
+                        dl_playout **out) {
     if (!out || !mode)
+        return DL_ERR_PARAM;
+    if (audio_channels != 0 && audio_channels != 2 && audio_channels != 8 &&
+        audio_channels != 16)
         return DL_ERR_PARAM;
     *out = nullptr;
 
@@ -222,8 +228,43 @@ int32_t dl_playout_open(const char *device, const char *mode,
         return DL_ERR_OPEN;
     }
 
+    // Optional audio: 48 kHz, 32-bit signed, timestamped so each block is
+    // placed on the same 90 kHz timeline as video (the caller supplies the
+    // stream time), giving hardware A/V sync under the shared playback clock.
+    if (audio_channels > 0) {
+        if (output->EnableAudioOutput(bmdAudioSampleRate48kHz,
+                                      bmdAudioSampleType32bitInteger,
+                                      (uint32_t)audio_channels,
+                                      bmdAudioOutputStreamTimestamped) != S_OK) {
+            dl_playout_close(po);
+            return DL_ERR_UNSUPPORTED;
+        }
+        po->audio_channels = audio_channels;
+    }
+
     *out = po;
     return DL_OK;
+}
+
+int32_t dl_playout_write_audio(dl_playout *po, const int32_t *samples,
+                               int32_t sample_frames, int64_t stream_time_90k) {
+    if (!po || !samples || sample_frames <= 0)
+        return DL_ERR_PARAM;
+    if (po->audio_channels <= 0)
+        return DL_ERR_UNSUPPORTED;
+    {
+        std::lock_guard<std::mutex> lk(po->mu);
+        if (po->stopping)
+            return DL_ERR_STOPPED;
+    }
+    // Timestamped schedule on the shared 90 kHz timeline. The SDK copies the
+    // buffer, so `samples` need not outlive this call. sampleFramesWritten is
+    // ignored: on a timestamped stream the SDK accepts the whole block.
+    uint32_t written = 0;
+    const HRESULT hr = po->output->ScheduleAudioSamples(
+        (void *)samples, (uint32_t)sample_frames, (BMDTimeValue)stream_time_90k,
+        kTimeScale, &written);
+    return hr == S_OK ? DL_OK : DL_ERR_OPEN;
 }
 
 int32_t dl_playout_info(const dl_playout *po, int32_t *width, int32_t *height,
@@ -345,6 +386,8 @@ void dl_playout_close(dl_playout *po) {
             po->output->StopScheduledPlayback(0, &actual_stop, kTimeScale);
         }
         po->output->SetScheduledFrameCompletionCallback(nullptr);
+        if (po->audio_channels > 0)
+            po->output->DisableAudioOutput();
         po->output->DisableVideoOutput();
         po->output->Release();
         po->output = nullptr;
