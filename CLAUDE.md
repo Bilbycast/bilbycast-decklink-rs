@@ -88,7 +88,13 @@ runtime (kernel driver + `libDeckLinkAPI.so`).
   callbacks pace the writer, no userspace timers. Playback auto-starts after
   a 3-frame pre-roll. Writing pixels into a `CreateVideoFrame` frame needs
   the same `IDeckLinkVideoBuffer` dance as capture, with
-  `bmdBufferAccessWrite`.
+  `bmdBufferAccessWrite`. `late_frames()` and `dropped_frames()` are
+  **separate cumulative counters, on purpose** — late means the card
+  displayed the frame behind its slot (soft, scheduling/CPU pressure) but
+  dropped means it was never presented (hard loss). A caller that sums them
+  into one "drops" figure loses that distinction; bilbycast-edge learned this
+  the hard way (its first cut summed them) and now surfaces both separately
+  on `OutputStats.sdi_stats`.
 * **Playout audio is timestamped for A/V sync.** `EnableAudioOutput` with
   `bmdAudioOutputStreamTimestamped` at 48 kHz / 32-bit; each block is
   scheduled with an explicit stream time on the SAME 90 kHz timeline as
@@ -102,6 +108,11 @@ runtime (kernel driver + `libDeckLinkAPI.so`).
   *not* exposed — `DetectedVideoInputMode` is the honest one. And several
   fields return `bmdModeUnknown` (`'iunk'`) rather than an error;
   `fourcc_to_string` maps that to `None`.
+* **`DeviceStatus.detected_dynamic_range`** (`BMDDynamicRange`, `0` = SDR,
+  non-zero = an HDR transfer) exists on every device but is easy to miss
+  wiring through — it was present in this crate from the start yet went
+  unmapped on the caller side for a while, silently dropped before reaching
+  any consumer. Worth grepping for on any new status-payload consumer.
 
 Observed on a DeckLink Quad 2 (locked 1080i50 on port 1, ports 2–8 idle):
 
