@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 namespace {
 
@@ -65,6 +66,49 @@ IDeckLink *find_device(const char *want) {
 }
 
 class PlayoutCallback;
+
+class OutputAncillaryPacket : public IDeckLinkAncillaryPacket {
+public:
+    explicit OutputAncillaryPacket(const dl_anc_packet &p)
+        : did_(p.did), sdid_(p.sdid), line_(p.line_number),
+          data_(p.data, p.data + p.len) {}
+
+    HRESULT GetBytes(BMDAncillaryPacketFormat format, const void **data,
+                     uint32_t *size) override {
+        if (format != bmdAncillaryPacketFormatUInt8)
+            return E_NOTIMPL;
+        if (data) *data = data_.data();
+        if (size) *size = static_cast<uint32_t>(data_.size());
+        return S_OK;
+    }
+    uint8_t GetDID() override { return did_; }
+    uint8_t GetSDID() override { return sdid_; }
+    uint32_t GetLineNumber() override { return line_; }
+    uint8_t GetDataStreamIndex() override { return 0; }
+    BMDAncillaryDataSpace GetDataSpace() override { return bmdAncillaryDataSpaceVANC; }
+    HRESULT QueryInterface(REFIID iid, void **out) override {
+        if (!out) return E_INVALIDARG;
+        *out = nullptr;
+        const REFIID unknown_iid = IID_IUnknown;
+        const bool is_unknown = std::memcmp(&iid, &unknown_iid, sizeof(REFIID)) == 0;
+        const bool is_packet =
+            std::memcmp(&iid, &IID_IDeckLinkAncillaryPacket, sizeof(REFIID)) == 0;
+        if (is_unknown || is_packet) {
+            *out = static_cast<IDeckLinkAncillaryPacket *>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG AddRef() override { return ++refs_; }
+    ULONG Release() override { ULONG n = --refs_; if (!n) delete this; return n; }
+private:
+    std::atomic<ULONG> refs_{1};
+    uint8_t did_;
+    uint8_t sdid_;
+    uint32_t line_;
+    std::vector<uint8_t> data_;
+};
 
 } // namespace
 
@@ -223,7 +267,9 @@ int32_t dl_playout_open(const char *device, const char *mode,
         dl_playout_close(po);
         return DL_ERR_OPEN;
     }
-    if (output->EnableVideoOutput(display_mode, bmdVideoOutputFlagDefault) != S_OK) {
+    // VANC must be enabled when opening the output; AttachPacket succeeds on
+    // a default-mode frame but the card will not put those packets on wire.
+    if (output->EnableVideoOutput(display_mode, bmdVideoOutputVANC) != S_OK) {
         dl_playout_close(po);
         return DL_ERR_OPEN;
     }
@@ -284,7 +330,9 @@ int32_t dl_playout_info(const dl_playout *po, int32_t *width, int32_t *height,
     return DL_OK;
 }
 
-int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size) {
+int32_t dl_playout_write_video_anc(dl_playout *po, const uint8_t *data, size_t size,
+                                   const dl_anc_packet *ancillary,
+                                   size_t ancillary_count) {
     if (!po || !data)
         return DL_ERR_PARAM;
     if (size != (size_t)po->row_bytes * (size_t)po->height)
@@ -337,6 +385,37 @@ int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size)
     vbuf->EndAccess(bmdBufferAccessWrite);
     vbuf->Release();
 
+    if (ancillary_count > 0) {
+        if (!ancillary) {
+            frame->Release();
+            std::lock_guard<std::mutex> lk(po->mu);
+            po->in_flight--;
+            return DL_ERR_PARAM;
+        }
+        IDeckLinkVideoFrameAncillaryPackets *packets = nullptr;
+        if (frame->QueryInterface(IID_IDeckLinkVideoFrameAncillaryPackets,
+                                  (void **)&packets) != S_OK || !packets) {
+            frame->Release();
+            std::lock_guard<std::mutex> lk(po->mu);
+            po->in_flight--;
+            return DL_ERR_UNSUPPORTED;
+        }
+        for (size_t i = 0; i < ancillary_count; ++i) {
+            if (!ancillary[i].data || ancillary[i].len == 0) continue;
+            auto *packet = new OutputAncillaryPacket(ancillary[i]);
+            const HRESULT attach = packets->AttachPacket(packet);
+            packet->Release();
+            if (attach != S_OK) {
+                packets->Release();
+                frame->Release();
+                std::lock_guard<std::mutex> lk(po->mu);
+                po->in_flight--;
+                return DL_ERR_OPEN;
+            }
+        }
+        packets->Release();
+    }
+
     const HRESULT hr = po->output->ScheduleVideoFrame(frame, po->next_time,
                                                       po->frame_duration,
                                                       kTimeScale);
@@ -362,6 +441,10 @@ int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size)
     if (start && po->output->StartScheduledPlayback(0, kTimeScale, 1.0) != S_OK)
         return DL_ERR_OPEN;
     return DL_OK;
+}
+
+int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size) {
+    return dl_playout_write_video_anc(po, data, size, nullptr, 0);
 }
 
 uint64_t dl_playout_late_frames(const dl_playout *po) {

@@ -155,6 +155,15 @@ pub struct DecklinkCaptureConfig {
 
 /// One packed 4:2:2 video frame off the SDI input.
 #[derive(Debug, Clone)]
+pub struct CapturedAncillaryPacket {
+    pub did: u8,
+    pub sdid: u8,
+    pub line_number: u16,
+    pub data: Vec<u8>,
+}
+
+/// One packed 4:2:2 video frame off the SDI input.
+#[derive(Debug, Clone)]
 pub struct CapturedVideo {
     /// Presentation timestamp in 90 kHz ticks (the card's stream time).
     pub pts: i64,
@@ -170,6 +179,8 @@ pub struct CapturedVideo {
     /// black), so callers may keep encoding to hold the transport stream up,
     /// but they must raise an alarm.
     pub signal_present: bool,
+    /// Generic VANC packets captured alongside this video frame.
+    pub ancillary: Vec<CapturedAncillaryPacket>,
 }
 
 /// One block of interleaved embedded PCM audio off the SDI input.
@@ -521,6 +532,23 @@ impl DecklinkCapture {
                 self.fr_den = f.fr_den as u32;
             }
             let data = unsafe { std::slice::from_raw_parts(f.data, f.size) }.to_vec();
+            let ancillary = if f.ancillary.is_null() {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(f.ancillary, f.ancillary_count) }
+                    .iter()
+                    .map(|p| CapturedAncillaryPacket {
+                        did: p.did,
+                        sdid: p.sdid,
+                        line_number: p.line_number,
+                        data: if p.data.is_null() {
+                            Vec::new()
+                        } else {
+                            unsafe { std::slice::from_raw_parts(p.data, p.len as usize) }.to_vec()
+                        },
+                    })
+                    .collect()
+            };
             CapturedFrame::Video(CapturedVideo {
                 pts: f.pts_90khz,
                 width: f.width as u32,
@@ -529,6 +557,7 @@ impl DecklinkCapture {
                 data,
                 stride: f.stride as usize,
                 signal_present: f.no_signal == 0,
+                ancillary,
             })
         } else {
             let n = f.size / 4;
@@ -708,13 +737,17 @@ impl DecklinkPlayout {
     /// of blocking forever, so a caller can re-check its own cancellation.
     pub fn write_video(&mut self, data: &[u8]) -> Result<()> {
         let rc = unsafe { sys::dl_playout_write_video(self.po, data.as_ptr(), data.len()) };
+        self.map_video_write_result(rc, data.len())
+    }
+
+    fn map_video_write_result(&self, rc: i32, data_len: usize) -> Result<()> {
         match rc {
             x if x == sys::DL_OK as i32 => Ok(()),
             x if x == sys::DL_TIMEOUT as i32 => Err(Error::Busy),
             x if x == sys::DL_ERR_STOPPED => Err(Error::Eof),
             x if x == sys::DL_ERR_PARAM => Err(Error::Io(format!(
                 "frame size mismatch: got {} bytes, mode wants {} ({}x{} rows)",
-                data.len(),
+                data_len,
                 self.row_bytes * self.height as usize,
                 self.row_bytes,
                 self.height,
@@ -724,6 +757,34 @@ impl DecklinkPlayout {
                 self.device
             ))),
         }
+    }
+
+    /// Schedule a video frame with generic VANC packets attached.
+    pub fn write_video_with_ancillary(
+        &mut self,
+        data: &[u8],
+        ancillary: &[CapturedAncillaryPacket],
+    ) -> Result<()> {
+        let native: Vec<sys::dl_anc_packet> = ancillary
+            .iter()
+            .map(|p| sys::dl_anc_packet {
+                did: p.did,
+                sdid: p.sdid,
+                line_number: p.line_number,
+                len: p.data.len().min(u32::MAX as usize) as u32,
+                data: p.data.as_ptr(),
+            })
+            .collect();
+        let rc = unsafe {
+            sys::dl_playout_write_video_anc(
+                self.po,
+                data.as_ptr(),
+                data.len(),
+                native.as_ptr(),
+                native.len(),
+            )
+        };
+        self.map_video_write_result(rc, data.len())
     }
 
     /// Frames the card reported as displayed late — the caller fell behind

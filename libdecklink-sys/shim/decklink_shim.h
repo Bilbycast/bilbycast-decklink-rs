@@ -42,6 +42,14 @@ extern "C" {
 
 typedef struct dl_capture dl_capture;
 
+typedef struct {
+    uint8_t did;
+    uint8_t sdid;
+    uint16_t line_number;
+    uint32_t len;
+    const uint8_t *data;
+} dl_anc_packet;
+
 /* One dequeued frame. `data` stays valid until `dl_release_frame`. */
 typedef struct {
     int32_t kind; /* DL_FRAME_VIDEO | DL_FRAME_AUDIO */
@@ -63,6 +71,10 @@ typedef struct {
     int64_t pts_90khz;
     const uint8_t *data;
     size_t size;
+
+    /* video ancillary packets; owned by `_owner` until release */
+    const dl_anc_packet *ancillary;
+    size_t ancillary_count;
 
     void *_owner; /* opaque: the SDK frame to Release() */
 } dl_frame;
@@ -173,6 +185,9 @@ int32_t dl_playout_info(const dl_playout *po, int32_t *width, int32_t *height,
  * after dl_playout_close, DL_TIMEOUT if the card stops draining, DL_ERR_PARAM
  * on a size mismatch. */
 int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size);
+int32_t dl_playout_write_video_anc(dl_playout *po, const uint8_t *data, size_t size,
+                                   const dl_anc_packet *ancillary,
+                                   size_t ancillary_count);
 
 /* Schedule one block of interleaved 32-bit signed audio at `stream_time_90k`
  * on the shared 90 kHz playout timeline. `samples` holds

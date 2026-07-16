@@ -17,6 +17,7 @@
 #include <mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -54,6 +55,8 @@ bool mode_from_fourcc(const char *s, BMDDisplayMode *out) {
 struct FrameOwner {
     IUnknown *frame = nullptr;             // video frame or audio packet
     IDeckLinkVideoBuffer *vbuf = nullptr;  // video only; held in StartAccess
+    std::vector<std::vector<uint8_t>> ancillary_data;
+    std::vector<dl_anc_packet> ancillary;
 };
 
 void release_owner(void *p) {
@@ -190,6 +193,38 @@ class Callback : public IDeckLinkInputCallback {
         owner->frame = v;
         owner->vbuf = vbuf;
 
+        IDeckLinkVideoFrameAncillaryPackets *anc_packets = nullptr;
+        if (v->QueryInterface(IID_IDeckLinkVideoFrameAncillaryPackets,
+                              (void **)&anc_packets) == S_OK && anc_packets) {
+            IDeckLinkAncillaryPacketIterator *iter = nullptr;
+            if (anc_packets->GetPacketIterator(&iter) == S_OK && iter) {
+                IDeckLinkAncillaryPacket *packet = nullptr;
+                while (iter->Next(&packet) == S_OK && packet) {
+                    const void *anc_bytes = nullptr;
+                    uint32_t anc_size = 0;
+                    if (packet->GetDataSpace() == bmdAncillaryDataSpaceVANC &&
+                        packet->GetBytes(bmdAncillaryPacketFormatUInt8,
+                                         &anc_bytes, &anc_size) == S_OK &&
+                        anc_bytes && anc_size > 0) {
+                        const auto *begin = static_cast<const uint8_t *>(anc_bytes);
+                        owner->ancillary_data.emplace_back(begin, begin + anc_size);
+                        dl_anc_packet meta{};
+                        meta.did = packet->GetDID();
+                        meta.sdid = packet->GetSDID();
+                        meta.line_number = static_cast<uint16_t>(packet->GetLineNumber());
+                        meta.len = anc_size;
+                        owner->ancillary.push_back(meta);
+                    }
+                    packet->Release();
+                    packet = nullptr;
+                }
+                iter->Release();
+            }
+            anc_packets->Release();
+        }
+        for (size_t i = 0; i < owner->ancillary.size(); ++i)
+            owner->ancillary[i].data = owner->ancillary_data[i].data();
+
         QueuedFrame qf{};
         qf.meta.kind = DL_FRAME_VIDEO;
         qf.meta.width = (int32_t)v->GetWidth();
@@ -200,6 +235,8 @@ class Callback : public IDeckLinkInputCallback {
         qf.meta.pts_90khz = (int64_t)t;
         qf.meta.data = (const uint8_t *)bytes;
         qf.meta.size = (size_t)v->GetRowBytes() * (size_t)v->GetHeight();
+        qf.meta.ancillary = owner->ancillary.data();
+        qf.meta.ancillary_count = owner->ancillary.size();
         {
             std::lock_guard<std::mutex> lk(cap_->mu);
             qf.meta.fr_num = cap_->fr_num;
@@ -532,6 +569,8 @@ void dl_release_frame(dl_frame *f) {
     release_owner(f->_owner);
     f->_owner = nullptr;
     f->data = nullptr;
+    f->ancillary = nullptr;
+    f->ancillary_count = 0;
 }
 
 uint64_t dl_dropped_frames(const dl_capture *cap) {
