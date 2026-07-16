@@ -1,11 +1,12 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 
-//! Safe SDI capture over Blackmagic DeckLink cards, via the DeckLink SDK.
+//! Safe SDI capture and playout over Blackmagic DeckLink cards, via the
+//! DeckLink SDK.
 //!
 //! bilbycast-edge depends on this crate (behind the off-by-default
-//! `sdi-decklink` feature) and drives it from `engine::sdi_io`, mirroring how
-//! `engine::mxl_video_io` drives `mxl-rs`.
+//! `sdi-decklink` feature) and drives it from `engine::sdi_io` and
+//! `engine::output_sdi`, mirroring how `engine::mxl_video_io` drives `mxl-rs`.
 //!
 //! # Why the SDK and not FFmpeg's `decklink` avdevice
 //!
@@ -40,9 +41,10 @@
 //!
 //! # Status
 //!
-//! Capture is implemented and verified against real hardware. Playout
-//! ([`DecklinkPlayout`]) is not implemented; its methods return
-//! [`Error::Unsupported`] rather than panicking.
+//! Capture and playout are both implemented and verified against real
+//! hardware. [`DecklinkPlayout`] schedules video and audio against the card's
+//! clock on one 90 kHz timeline that the *caller* owns — see
+//! [`DecklinkPlayout::write_video`].
 
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -50,8 +52,8 @@ use std::time::{Duration, Instant};
 
 use libdecklink_sys as sys;
 
-/// Blocking wait per `dl_read_frame` call.
-const READ_TIMEOUT_MS: i32 = 1_000;
+/// Blocking wait per `dl_read_frame` call made by [`DecklinkCapture::read_frame`].
+const READ_TIMEOUT_MS: u32 = 1_000;
 /// If no frame arrives for this long, treat the device as gone so the caller can
 /// re-open it. A live SDI input delivers frames continuously — even with no
 /// signal, the card emits frames flagged `no_signal`. Silence means the device
@@ -90,6 +92,13 @@ pub enum Error {
     /// own cancellation — rather than treat the device as failed.
     #[error("playout busy: scheduled-frame queue full")]
     Busy,
+    /// The playout timeline went backwards: a frame's `stream_time_90k` did not
+    /// advance past the one before it. The frame was not scheduled — the SDK
+    /// requires ascending display order. A caller whose source stepped its PTS
+    /// (discontinuity, loop, input switch to an unrelated clock) must re-anchor
+    /// its epoch rather than keep writing against the old one.
+    #[error("playout time not monotonic: {0}")]
+    TimeNotMonotonic(String),
     /// The capture was closed.
     #[error("decklink stream ended")]
     Eof,
@@ -106,8 +115,18 @@ pub struct DecklinkDeviceInfo {
     /// Display name, e.g. `"DeckLink Quad (1)"`. This is what bilbycast-edge
     /// stores in `SdiInputConfig::device`.
     pub name: String,
-    /// SDI connector index parsed from a trailing `(N)`, when present.
+    /// SDI connector index parsed from a trailing `(N)`, when present. This is
+    /// the *software* channel — on cards whose numbering interleaves it is not
+    /// the BNC the operator patches. See [`physical_port`](Self::physical_port).
     pub sdi_channel: Option<u8>,
+    /// The BNC this sub-device occupies, counting from the REF connector
+    /// outward — what an operator reads off the card's backplate.
+    ///
+    /// `None` unless the card's connector layout has been *verified*: only the
+    /// 8-port DeckLink Quad is today, and only when the whole card enumerates.
+    /// A wrong number sends someone to the wrong cable, so an unrecognised
+    /// model says nothing rather than guessing.
+    pub physical_port: Option<u8>,
 }
 
 /// Pixel format of a captured frame. SDI is natively packed 4:2:2.
@@ -196,6 +215,60 @@ fn parse_sdi_channel(name: &str) -> Option<u8> {
     let close = name.rfind(')')?;
     let open = name[..close].rfind('(')?;
     name[open + 1..close].trim().parse().ok()
+}
+
+/// The model, with the trailing sub-device suffix removed:
+/// `"DeckLink Quad (3)"` → `"DeckLink Quad"`.
+fn model_name(name: &str) -> &str {
+    let Some(close) = name.rfind(')') else {
+        return name.trim();
+    };
+    match name[..close].rfind('(') {
+        Some(open) => name[..open].trim(),
+        None => name.trim(),
+    }
+}
+
+/// The only model whose physical connector layout is verified.
+const QUAD_MODEL: &str = "DeckLink Quad";
+
+/// Physical BNC per software channel on 8-port DeckLink Quad cards, indexed by
+/// `sdi_channel - 1`.
+///
+/// Counting the SDI connectors outward from the REF/genlock BNC, software
+/// numbering interleaves — physical 1..8 are software 1, 5, 2, 6, 3, 7, 4, 8 —
+/// so sub-devices pair as (1,5), (2,6), (3,7), (4,8) across two adjacent
+/// connectors. Per Blackmagic's Desktop Video Utility diagram, verified
+/// empirically on a DeckLink Quad 2.
+const QUAD8_PHYSICAL_PORT: [u8; 8] = [1, 3, 5, 7, 2, 4, 6, 8];
+
+/// Fill in [`DecklinkDeviceInfo::physical_port`] for the devices whose layout
+/// is known.
+///
+/// The mapping is only claimed for a complete 8-port Quad — eight sub-devices
+/// of that model covering channels 1..=8. Any other model, a Quad that is not
+/// all there, or two of them in one host leaves `physical_port` as `None`:
+/// nothing else on the connector side has been verified, and a made-up port
+/// number is worse than no port number.
+fn resolve_physical_ports(devices: &mut [DecklinkDeviceInfo]) {
+    let quad: Vec<usize> = devices
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| model_name(&d.name) == QUAD_MODEL)
+        .map(|(i, _)| i)
+        .collect();
+    let complete = quad.len() == QUAD8_PHYSICAL_PORT.len()
+        && (1..=8).all(|ch| quad.iter().any(|&i| devices[i].sdi_channel == Some(ch)));
+    if !complete {
+        return;
+    }
+    for i in quad {
+        devices[i].physical_port = devices[i].sdi_channel.and_then(|ch| {
+            QUAD8_PHYSICAL_PORT
+                .get(usize::from(ch).checked_sub(1)?)
+                .copied()
+        });
+    }
 }
 
 /// `bmdModeUnknown` — the SDK's "I have nothing to report" raster FourCC
@@ -316,10 +389,23 @@ pub fn device_status(index: u32) -> Result<DeviceStatus> {
     })
 }
 
+/// Whether the DeckLink API is reachable on this host — Desktop Video is
+/// installed and `libDeckLinkAPI.so` was dlopened successfully.
+///
+/// Distinct from [`enumerate_devices`] returning empty, which is a working API
+/// reporting no cards fitted. A card can be plugged into that host; it can
+/// never appear on one with no driver. Callers deciding whether SDI is
+/// *possible* here want this; callers listing what is *present* want
+/// [`enumerate_devices`].
+pub fn api_available() -> bool {
+    unsafe { sys::dl_api_available() != 0 }
+}
+
 /// Enumerate the DeckLink devices on this host.
 ///
 /// Returns an empty vec when Desktop Video is not installed or no card is
-/// present, so a probe on a non-SDI host is a clean no-op.
+/// present, so a probe on a non-SDI host is a clean no-op. Use
+/// [`api_available`] to tell those two cases apart.
 ///
 /// Unlike FFmpeg's avdevice enumeration, this releases the SDK iterator cleanly
 /// and does **not** wedge the device, so it is safe to call before capturing.
@@ -341,9 +427,13 @@ pub fn enumerate_devices() -> Vec<DecklinkDeviceInfo> {
         out.push(DecklinkDeviceInfo {
             index: index as u32,
             sdi_channel: parse_sdi_channel(&name),
+            physical_port: None,
             name,
         });
     }
+    // Needs the whole enumeration, not one device: the layout is only claimed
+    // for a card that is all present.
+    resolve_physical_ports(&mut out);
     out
 }
 
@@ -422,7 +512,7 @@ impl DecklinkCapture {
             if Instant::now() >= deadline {
                 return Err(Error::NoSignal(cfg.device.clone()));
             }
-            match me.next_raw()? {
+            match me.next_raw(READ_TIMEOUT_MS)? {
                 Some(CapturedFrame::Video(v)) => break v,
                 // Audio before the first video frame: discard, we need the raster.
                 Some(CapturedFrame::Audio(_)) | None => continue,
@@ -434,7 +524,7 @@ impl DecklinkCapture {
         // callback re-arms the input and later frames carry the truth.
         let settle = Instant::now() + FORMAT_SETTLE;
         while Instant::now() < settle {
-            match me.next_raw() {
+            match me.next_raw(READ_TIMEOUT_MS) {
                 Ok(Some(CapturedFrame::Video(v))) => latest = v,
                 Ok(_) => continue,
                 // A transient during re-arm must not fail the open.
@@ -481,27 +571,45 @@ impl DecklinkCapture {
     ///
     /// Note that **signal loss does not end the stream**: the card keeps
     /// delivering frames with [`CapturedVideo::signal_present`] set to `false`.
+    ///
+    /// This waits out [`NO_FRAME_TIMEOUT`] before returning, so a caller that
+    /// must react to its own cancellation sooner wants
+    /// [`read_frame_timeout`](Self::read_frame_timeout).
     pub fn read_frame(&mut self) -> Result<CapturedFrame> {
-        if let Some(v) = self.pending.take() {
-            return Ok(CapturedFrame::Video(v));
-        }
         let deadline = Instant::now() + NO_FRAME_TIMEOUT;
         loop {
-            match self.next_raw()? {
-                Some(f) => return Ok(f),
-                None => {
-                    if Instant::now() >= deadline {
-                        return Err(Error::NoSignal(self.device.clone()));
-                    }
-                }
+            if let Some(f) = self.read_frame_timeout(READ_TIMEOUT_MS)? {
+                return Ok(f);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::NoSignal(self.device.clone()));
             }
         }
     }
 
+    /// Wait up to `timeout_ms` for the next frame; `Ok(None)` means none
+    /// arrived in that window.
+    ///
+    /// The cancellable form of [`read_frame`](Self::read_frame). A silent
+    /// window is not an error here — the caller decides how much silence means
+    /// the device is gone — so a caller polling a `CancellationToken` between
+    /// calls bounds its shutdown latency by `timeout_ms` instead of by
+    /// [`NO_FRAME_TIMEOUT`]. A dead device is the case where the difference
+    /// matters, because that is exactly when no frame ever arrives to return.
+    pub fn read_frame_timeout(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
+        if let Some(v) = self.pending.take() {
+            return Ok(Some(CapturedFrame::Video(v)));
+        }
+        self.next_raw(timeout_ms)
+    }
+
     /// One `dl_read_frame` attempt. `Ok(None)` == timed out, try again.
-    fn next_raw(&mut self) -> Result<Option<CapturedFrame>> {
+    fn next_raw(&mut self, timeout_ms: u32) -> Result<Option<CapturedFrame>> {
+        // The shim's wait is an int32 millisecond count; anything beyond that
+        // is a caller asking to block ~indefinitely, which it already gets.
+        let timeout_ms = timeout_ms.min(i32::MAX as u32) as i32;
         let mut f: sys::dl_frame = unsafe { std::mem::zeroed() };
-        let rc = unsafe { sys::dl_read_frame(self.cap, &mut f, READ_TIMEOUT_MS) };
+        let rc = unsafe { sys::dl_read_frame(self.cap, &mut f, timeout_ms) };
 
         if rc == sys::DL_TIMEOUT as i32 {
             return Ok(None);
@@ -574,14 +682,17 @@ pub struct DecklinkPlayoutConfig {
     pub audio_sample_rate: u32,
 }
 
-/// Live SDI playout handle (video only today).
+/// Live SDI playout handle.
 ///
 /// Frames are *scheduled* against the card's clock: `write_video` copies the
-/// frame into card memory and queues it after the previous one; playback
-/// starts automatically once a small pre-roll is queued, and the call blocks
-/// while the in-flight window is full — so the card's cadence paces the
-/// caller. Drive it from a blocking thread, exactly like
+/// frame into card memory and queues it for the display time the caller gives
+/// it; playback starts automatically once a small pre-roll is queued, and the
+/// call blocks while the in-flight window is full — so the card's cadence paces
+/// the caller. Drive it from a blocking thread, exactly like
 /// [`DecklinkCapture::read_frame`].
+///
+/// Video and audio ride one 90 kHz timeline whose origin is the first video
+/// frame, which is what makes the card lip-sync them in hardware.
 pub struct DecklinkPlayout {
     po: *mut sys::dl_playout,
     device: String,
@@ -701,17 +812,36 @@ impl DecklinkPlayout {
         self.row_bytes
     }
 
-    /// Schedule one UYVY422 frame. `data` must be exactly
-    /// `row_bytes() * height` bytes. Blocks while the in-flight window is
-    /// full — the card's clock paces the caller — but only up to a bounded
-    /// timeout: if the card stops draining it returns [`Error::Busy`] instead
-    /// of blocking forever, so a caller can re-check its own cancellation.
-    pub fn write_video(&mut self, data: &[u8]) -> Result<()> {
-        let rc = unsafe { sys::dl_playout_write_video(self.po, data.as_ptr(), data.len()) };
+    /// Schedule one UYVY422 frame for display at `stream_time_90k`. `data` must
+    /// be exactly `row_bytes() * height` bytes.
+    ///
+    /// `stream_time_90k` is the frame's `source_pts_90k - first_video_pts_90k`
+    /// — the same 90 kHz timeline [`write_audio`](Self::write_audio) schedules
+    /// onto, which is what lets the card lip-sync the two. It must advance on
+    /// every call ([`Error::TimeNotMonotonic`] otherwise).
+    ///
+    /// The display time is the **caller's**, never a count of writes that
+    /// succeeded: a frame the caller skips or one that fails to schedule leaves
+    /// a hole in the picture, and the frames after it still land where their
+    /// timestamps say. That is what keeps video and audio together across a
+    /// decode error or a keyframe wait after a discontinuity.
+    ///
+    /// Blocks while the in-flight window is full — the card's clock paces the
+    /// caller — but only up to a bounded timeout: if the card stops draining it
+    /// returns [`Error::Busy`] instead of blocking forever, so a caller can
+    /// re-check its own cancellation.
+    pub fn write_video(&mut self, data: &[u8], stream_time_90k: i64) -> Result<()> {
+        let rc = unsafe {
+            sys::dl_playout_write_video(self.po, data.as_ptr(), data.len(), stream_time_90k)
+        };
         match rc {
             x if x == sys::DL_OK as i32 => Ok(()),
             x if x == sys::DL_TIMEOUT as i32 => Err(Error::Busy),
             x if x == sys::DL_ERR_STOPPED => Err(Error::Eof),
+            x if x == sys::DL_ERR_TIME => Err(Error::TimeNotMonotonic(format!(
+                "frame at {stream_time_90k} does not advance the playout timeline on '{}'",
+                self.device
+            ))),
             x if x == sys::DL_ERR_PARAM => Err(Error::Io(format!(
                 "frame size mismatch: got {} bytes, mode wants {} ({}x{} rows)",
                 data.len(),
@@ -793,13 +923,119 @@ impl Drop for DecklinkPlayout {
 
 #[cfg(test)]
 mod tests {
-    use super::{fourcc_to_string, parse_sdi_channel, tri_to_bool};
+    use super::{
+        fourcc_to_string, model_name, parse_sdi_channel, resolve_physical_ports, tri_to_bool,
+        DecklinkDeviceInfo,
+    };
+
+    /// Build an enumeration as `enumerate_devices` would, before the mapping.
+    fn devices(names: &[&str]) -> Vec<DecklinkDeviceInfo> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| DecklinkDeviceInfo {
+                index: i as u32,
+                name: (*n).to_string(),
+                sdi_channel: parse_sdi_channel(n),
+                physical_port: None,
+            })
+            .collect()
+    }
+
+    fn quad8() -> Vec<DecklinkDeviceInfo> {
+        devices(&[
+            "DeckLink Quad (1)",
+            "DeckLink Quad (2)",
+            "DeckLink Quad (3)",
+            "DeckLink Quad (4)",
+            "DeckLink Quad (5)",
+            "DeckLink Quad (6)",
+            "DeckLink Quad (7)",
+            "DeckLink Quad (8)",
+        ])
+    }
 
     #[test]
     fn parses_connector_index() {
         assert_eq!(parse_sdi_channel("DeckLink Quad (3)"), Some(3));
         assert_eq!(parse_sdi_channel("DeckLink Duo 2"), None);
         assert_eq!(parse_sdi_channel("Weird (x)"), None);
+    }
+
+    #[test]
+    fn strips_subdevice_suffix_from_model() {
+        assert_eq!(model_name("DeckLink Quad (3)"), "DeckLink Quad");
+        assert_eq!(model_name("DeckLink Duo 2"), "DeckLink Duo 2");
+        assert_eq!(model_name("DeckLink 8K Pro (1)"), "DeckLink 8K Pro");
+    }
+
+    #[test]
+    fn maps_quad8_software_channel_to_physical_bnc() {
+        let mut d = quad8();
+        resolve_physical_ports(&mut d);
+        // Physical 1..8 are software 1, 5, 2, 6, 3, 7, 4, 8 — so the operator
+        // patching BNC 2 wants "(5)", not "(2)".
+        let got: Vec<Option<u8>> = d.iter().map(|d| d.physical_port).collect();
+        assert_eq!(
+            got,
+            vec![
+                Some(1),
+                Some(3),
+                Some(5),
+                Some(7),
+                Some(2),
+                Some(4),
+                Some(6),
+                Some(8)
+            ]
+        );
+    }
+
+    #[test]
+    fn quad8_pairs_share_adjacent_connectors() {
+        let mut d = quad8();
+        resolve_physical_ports(&mut d);
+        let port = |ch: u8| {
+            d.iter()
+                .find(|d| d.sdi_channel == Some(ch))
+                .and_then(|d| d.physical_port)
+                .unwrap()
+        };
+        // Sub-devices pair as (1,5), (2,6), (3,7), (4,8), each pair owning two
+        // adjacent BNCs — that is the routing rule for playout on a port whose
+        // own connector is carrying an input.
+        for (a, b) in [(1, 5), (2, 6), (3, 7), (4, 8)] {
+            assert_eq!(port(b), port(a) + 1, "pair ({a},{b}) is not adjacent");
+        }
+    }
+
+    #[test]
+    fn unverified_layouts_say_nothing() {
+        // Unknown model: no mapping has been verified, so no claim.
+        let mut duo = devices(&["DeckLink Duo (1)", "DeckLink Duo (2)"]);
+        resolve_physical_ports(&mut duo);
+        assert!(duo.iter().all(|d| d.physical_port.is_none()));
+
+        // A Quad that is not all there — the layout is only known whole.
+        let mut partial = devices(&["DeckLink Quad (1)", "DeckLink Quad (2)"]);
+        resolve_physical_ports(&mut partial);
+        assert!(partial.iter().all(|d| d.physical_port.is_none()));
+
+        // Eight of them, but the channels are not 1..=8.
+        let mut odd = quad8();
+        odd[7].name = "DeckLink Quad (9)".to_string();
+        odd[7].sdi_channel = Some(9);
+        resolve_physical_ports(&mut odd);
+        assert!(odd.iter().all(|d| d.physical_port.is_none()));
+    }
+
+    #[test]
+    fn a_quad_beside_another_card_still_maps() {
+        let mut d = quad8();
+        d.extend(devices(&["DeckLink Duo (1)"]));
+        resolve_physical_ports(&mut d);
+        assert_eq!(d[4].physical_port, Some(2)); // software (5) → BNC 2
+        assert_eq!(d[8].physical_port, None); // the Duo is not ours to claim
     }
 
     #[test]

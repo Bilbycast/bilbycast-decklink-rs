@@ -273,6 +273,14 @@ IDeckLink *find_device(const char *want) {
 
 extern "C" {
 
+int32_t dl_api_available(void) {
+    IDeckLinkIterator *iter = CreateDeckLinkIteratorInstance();
+    if (!iter)
+        return 0;
+    iter->Release();
+    return 1;
+}
+
 int32_t dl_device_count(void) {
     IDeckLinkIterator *iter = CreateDeckLinkIteratorInstance();
     if (!iter)

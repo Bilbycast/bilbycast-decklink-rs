@@ -80,9 +80,13 @@ struct dl_playout {
 
     int32_t audio_channels = 0; // 0 == audio disabled
 
-    // Schedule clock: each frame plays for `frame_duration` kTimeScale ticks.
+    // How long each frame is displayed, in kTimeScale ticks. Not an
+    // accumulator — display times come from the caller — so this is only the
+    // SDK's duration argument.
     BMDTimeValue frame_duration = 0;
-    BMDTimeValue next_time = 0;
+    // Last display time handed to the SDK, which requires ascending order.
+    BMDTimeValue last_time = 0;
+    bool have_last = false;
     int64_t fr_num = 0;
     int64_t fr_den = 0;
 
@@ -146,6 +150,13 @@ private:
     std::atomic<ULONG> ref_{1};
 };
 
+// Give back the in-flight slot reserved before scheduling, for a frame that
+// never reached the card and so will never complete.
+void release_inflight(dl_playout *po) {
+    std::lock_guard<std::mutex> lk(po->mu);
+    po->in_flight--;
+}
+
 } // namespace
 
 extern "C" {
@@ -204,7 +215,10 @@ int32_t dl_playout_open(const char *device, const char *mode,
     if (dm->GetFrameRate(&dur, &scale) == S_OK && dur > 0 && scale > 0) {
         po->fr_num = (int64_t)scale;
         po->fr_den = (int64_t)dur;
-        // dur/scale seconds per frame, expressed in kTimeScale ticks.
+        // dur/scale seconds per frame in kTimeScale ticks, floored so a frame
+        // is never displayed past the next one's start (1501, not 1501.5, at
+        // 59.94). Consecutive display times come from the caller, so the
+        // truncation cannot accumulate.
         po->frame_duration = (BMDTimeValue)((dur * kTimeScale) / scale);
     }
     dm->Release();
@@ -284,7 +298,8 @@ int32_t dl_playout_info(const dl_playout *po, int32_t *width, int32_t *height,
     return DL_OK;
 }
 
-int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size) {
+int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size,
+                               int64_t stream_time_90k) {
     if (!po || !data)
         return DL_ERR_PARAM;
     if (size != (size_t)po->row_bytes * (size_t)po->height)
@@ -297,6 +312,12 @@ int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size)
     // control and can re-check its own cancellation before trying again.
     {
         std::unique_lock<std::mutex> lk(po->mu);
+        // Ascending display order is the SDK's contract. The caller owns the
+        // timeline, so this is a guard and not a generator: refusing the frame
+        // surfaces a timeline the caller must re-anchor, where handing the SDK
+        // a time that walks backwards is undefined.
+        if (po->have_last && (BMDTimeValue)stream_time_90k <= po->last_time)
+            return DL_ERR_TIME;
         const bool ready = po->cv.wait_for(
             lk, std::chrono::milliseconds(500), [po] {
                 return po->stopping || po->in_flight < DL_PLAYOUT_MAX_INFLIGHT;
@@ -313,8 +334,7 @@ int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size)
                                      po->pixfmt, bmdFrameFlagDefault,
                                      &frame) != S_OK ||
         !frame) {
-        std::lock_guard<std::mutex> lk(po->mu);
-        po->in_flight--;
+        release_inflight(po);
         return DL_ERR_OPEN;
     }
 
@@ -322,38 +342,46 @@ int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size)
     // access window — IDeckLinkVideoFrame::GetBytes is gone. Same trap as
     // capture, write access this time.
     IDeckLinkVideoBuffer *vbuf = nullptr;
-    void *bytes = nullptr;
     if (frame->QueryInterface(IID_IDeckLinkVideoBuffer, (void **)&vbuf) != S_OK ||
-        !vbuf || vbuf->StartAccess(bmdBufferAccessWrite) != S_OK) {
-        if (vbuf)
-            vbuf->Release();
+        !vbuf) {
         frame->Release();
-        std::lock_guard<std::mutex> lk(po->mu);
-        po->in_flight--;
+        release_inflight(po);
         return DL_ERR_OPEN;
     }
-    vbuf->GetBytes(&bytes);
+    if (vbuf->StartAccess(bmdBufferAccessWrite) != S_OK) {
+        vbuf->Release();
+        frame->Release();
+        release_inflight(po);
+        return DL_ERR_OPEN;
+    }
+    void *bytes = nullptr;
+    if (vbuf->GetBytes(&bytes) != S_OK || !bytes) {
+        vbuf->EndAccess(bmdBufferAccessWrite);
+        vbuf->Release();
+        frame->Release();
+        release_inflight(po);
+        return DL_ERR_OPEN;
+    }
     std::memcpy(bytes, data, size);
     vbuf->EndAccess(bmdBufferAccessWrite);
     vbuf->Release();
 
-    const HRESULT hr = po->output->ScheduleVideoFrame(frame, po->next_time,
-                                                      po->frame_duration,
-                                                      kTimeScale);
+    const HRESULT hr = po->output->ScheduleVideoFrame(
+        frame, (BMDTimeValue)stream_time_90k, po->frame_duration, kTimeScale);
     // The card holds its own reference until completion.
     frame->Release();
     if (hr != S_OK) {
-        std::lock_guard<std::mutex> lk(po->mu);
-        po->in_flight--;
+        release_inflight(po);
         return DL_ERR_OPEN;
     }
-    po->next_time += po->frame_duration;
 
     // Start the clock once the pre-roll is queued, so the first frames do not
     // play into an unprimed pipeline.
     bool start = false;
     {
         std::lock_guard<std::mutex> lk(po->mu);
+        po->last_time = (BMDTimeValue)stream_time_90k;
+        po->have_last = true;
         if (!po->started && po->in_flight >= DL_PLAYOUT_PREROLL) {
             po->started = true;
             start = true;

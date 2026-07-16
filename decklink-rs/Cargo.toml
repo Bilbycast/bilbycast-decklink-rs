@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
 publish = false
-description = "Safe Rust wrapper over FFmpeg's DeckLink avdevice: SDI capture (DecklinkCapture), playout (DecklinkPlayout), and device enumeration for bilbycast-edge"
+description = "Safe Rust wrapper over the Blackmagic DeckLink SDK: SDI capture (DecklinkCapture), scheduled playout (DecklinkPlayout), device status, and enumeration for bilbycast-edge"
 
 [dependencies]
 libdecklink-sys = { path = "../libdecklink-sys" }

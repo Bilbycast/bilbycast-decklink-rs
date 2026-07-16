@@ -78,7 +78,11 @@ fn main() {
                 line[o + 3] = y;
             }
         }
-        if let Err(e) = po.write_video(&frame) {
+        // Frame i's display time on the playout timeline, derived from the frame
+        // index rather than accumulated so a fractional rate (59.94) does not
+        // drift. A real caller passes `source_pts_90k - first_video_pts_90k`.
+        let stream_time = i as i64 * 90_000 * den as i64 / num.max(1) as i64;
+        if let Err(e) = po.write_video(&frame, stream_time) {
             eprintln!("write_video failed at frame {i}: {e}");
             std::process::exit(1);
         }

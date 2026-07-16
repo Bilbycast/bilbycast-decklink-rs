@@ -58,14 +58,16 @@ config, and the upstream bugs found during bring-up.
   card answers per-field and "unknown" is never rendered as "no".
 * `DecklinkPlayout` — scheduled **video + audio playout** against the card's
   clock (3-frame pre-roll, completion-callback-paced in-flight window,
-  late/dropped counters). Audio is 48 kHz 32-bit interleaved, scheduled
-  timestamped on the shared 90 kHz timeline so a caller supplying
-  `audio_pts - first_video_pts` gets hardware A/V sync. Verified by physical
-  BNC loopback: bars/video out one sub-device, captured on the looped port —
-  correct colours, live motion, continuous audio, `late=0 dropped=0`.
+  late/dropped counters). Both essences are scheduled on one 90 kHz timeline
+  the caller owns — pass each as `essence_pts - first_video_pts` and the card
+  lip-syncs them in hardware. Audio is 48 kHz 32-bit interleaved. Verified by
+  physical BNC loopback: bars/video out one sub-device, captured on the looped
+  port — correct colours, live motion, continuous audio, `late=0 dropped=0`.
 
 On 8-port Quad cards the physical→software connector mapping interleaves and
-sub-device pairs share connectors — see CLAUDE.md before touching a rack.
+sub-device pairs share connectors, so `enumerate_devices` reports the BNC as
+`physical_port` (`None` on any model whose layout is not verified) — see
+CLAUDE.md before touching a rack.
 
 ## License
 

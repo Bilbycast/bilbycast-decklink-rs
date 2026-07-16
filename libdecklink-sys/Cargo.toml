@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 license = "MPL-2.0"
 publish = false
-description = "Raw FFI to a C ABI shim over the Blackmagic DeckLink SDK (capture)"
+description = "Raw FFI to a C ABI shim over the Blackmagic DeckLink SDK (capture + playout)"
 
 [lib]
 doctest = false
