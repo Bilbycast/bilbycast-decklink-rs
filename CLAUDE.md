@@ -95,6 +95,19 @@ runtime (kernel driver + `libDeckLinkAPI.so`).
   into one "drops" figure loses that distinction; bilbycast-edge learned this
   the hard way (its first cut summed them) and now surfaces both separately
   on `OutputStats.sdi_stats`.
+* **The caller owns the playout timeline.** `write_video` takes an explicit
+  `stream_time_90k` on the same 90 kHz timeline as `write_audio`; both are
+  `essence_pts - first_video_pts`. Video card-time used to be a count of
+  *successful* writes accumulated inside the shim, while audio was already
+  absolute — so any skipped write (decode error, raster mismatch, `Busy`,
+  feeder overflow, a keyframe wait after a discontinuity) pulled every later
+  frame one slot earlier while audio stayed put, and the two desynchronised
+  permanently with nothing in the telemetry to show it. Deriving an essence's
+  clock from how much work succeeded is the bug; the caller's timestamps are
+  the only thing that survives a dropped frame. The SDK wants ascending
+  display times, so a `stream_time_90k` that does not advance is refused
+  (`Error::TimeNotMonotonic`) instead of being handed over — a caller whose
+  source steps its PTS has to re-anchor its epoch.
 * **Playout audio is timestamped for A/V sync.** `EnableAudioOutput` with
   `bmdAudioOutputStreamTimestamped` at 48 kHz / 32-bit; each block is
   scheduled with an explicit stream time on the SAME 90 kHz timeline as
@@ -163,6 +176,13 @@ Video Utility diagram, verified empirically on this card):
 | physical | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 |----------|---|---|---|---|---|---|---|---|
 | software | 1 | 5 | 2 | 6 | 3 | 7 | 4 | 8 |
+
+`enumerate_devices` resolves this into `DecklinkDeviceInfo::physical_port`, so
+a consumer does not have to know the table — but only for a *complete* 8-port
+Quad (eight sub-devices, channels 1..=8). No other model's layout has been
+verified, so every one of them reports `None`: sending an operator to the wrong
+BNC is worse than admitting the card is unknown. Adding a model means verifying
+it on the bench, not inferring it.
 
 Sub-devices pair as (1,5), (2,6), (3,7), (4,8) — each pair shares two
 *adjacent* physical connectors. The pairing is live routing, not trivia:
@@ -251,7 +271,8 @@ review (full narrative: bilbycast-edge `docs/sdi.md`):
    stays in bilbycast-edge's `video-engine`.
 4. **Feature-gated off in bilbycast-edge** (`sdi-decklink`). Never default-on.
 5. **Never panic** — this crate is linked into a long-running broadcast binary.
-   Unimplemented playout returns `Error::Unsupported`, not `todo!()`.
+   Requests it cannot serve (v210 playout, a mode the card refuses) return
+   `Error::Unsupported`, not `todo!()`.
 
 ## Historical note: the enumerate wedge
 

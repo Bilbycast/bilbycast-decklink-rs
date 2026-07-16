@@ -1,16 +1,15 @@
 # bilbycast-decklink-rs — Blackmagic DeckLink SDI capture/playout for bilbycast-edge.
 #
 # Two-crate workspace mirroring `bilbycast-ffmpeg-video-rs`:
-#   libdecklink-sys — raw FFI over FFmpeg libavdevice/libavformat/libavcodec/
-#                     libavutil, built with the `decklink` in/out avdevice.
+#   libdecklink-sys — a C++ shim exposing a C ABI over the Blackmagic DeckLink
+#                     SDK, plus its bindgen FFI.
 #   decklink-rs     — safe wrapper (DecklinkCapture, DecklinkPlayout,
-#                     enumerate_devices) that bilbycast-edge depends on.
+#                     device_status, enumerate_devices) that bilbycast-edge
+#                     depends on.
 #
-# Kept OUT of bilbycast-ffmpeg-video-rs on purpose: that crate is a minimal
-# libavcodec/util/swscale build with `--disable-avdevice --disable-avformat`
-# and no proprietary linkage. DeckLink needs both of those libs PLUS the
-# Blackmagic DeckLink SDK headers at FFmpeg-configure time, so it lives here
-# behind bilbycast-edge's off-by-default `sdi-decklink` feature.
+# Kept OUT of bilbycast-ffmpeg-video-rs on purpose: this workspace needs the
+# Blackmagic DeckLink SDK headers at build time and links no FFmpeg at all, so
+# it lives here behind bilbycast-edge's off-by-default `sdi-decklink` feature.
 [workspace]
 resolver = "2"
 members = [

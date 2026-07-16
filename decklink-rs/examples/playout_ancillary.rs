@@ -15,8 +15,14 @@ fn main() {
     // SCTE-104 start_normal, event 0x12345678, 500 ms pre-roll, 30 s auto-return.
     let payload = vec![0,25,0,0,0,0,0,0,1,1,0,13,1,0x12,0x34,0x56,0x78,0,1,0xf4,1,0x2c,0,0,1];
     let anc = [CapturedAncillaryPacket { did: 0x41, sdid: 0x07, line_number: 0, data: payload }];
-    for _ in 0..500 {
-        po.write_video_with_ancillary(&frame, &anc).expect("schedule frame with ANC");
+    let (num, den) = po.video_frame_rate();
+    for i in 0..500i64 {
+        // Derived from the frame index rather than accumulated, so a fractional
+        // rate does not drift. A real caller passes
+        // `source_pts_90k - first_video_pts_90k`.
+        let stream_time = i * 90_000 * den as i64 / num.max(1) as i64;
+        po.write_video_with_ancillary(&frame, stream_time, &anc)
+            .expect("schedule frame with ANC");
     }
     println!("scheduled 500 SCTE-104 ANC frames; late={} dropped={}", po.late_frames(), po.dropped_frames());
 }

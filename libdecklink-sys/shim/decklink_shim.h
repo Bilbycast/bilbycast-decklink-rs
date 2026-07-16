@@ -31,6 +31,7 @@ extern "C" {
 #define DL_ERR_OPEN (-3)
 #define DL_ERR_UNSUPPORTED (-4)
 #define DL_ERR_STOPPED (-5) /* capture closed while waiting */
+#define DL_ERR_TIME (-6)    /* playout: stream time did not advance */
 
 /* ── pixel formats ────────────────────────────────────────────────────── */
 #define DL_PIXFMT_UYVY422 0 /* bmdFormat8BitYUV  */
@@ -80,8 +81,15 @@ typedef struct {
 } dl_frame;
 
 /* ── enumeration ──────────────────────────────────────────────────────── */
+/* Whether the DeckLink API itself is reachable — i.e. Desktop Video is
+ * installed and DeckLinkAPIDispatch could dlopen libDeckLinkAPI.so. Distinct
+ * from a device count of 0, which is a working API reporting no cards fitted:
+ * a card can be plugged into the latter, never into the former. */
+int32_t dl_api_available(void);
 /* Unlike FFmpeg's avdevice enumeration, this releases the iterator cleanly and
- * does NOT wedge the device, so it is safe to call before capturing. */
+ * does NOT wedge the device, so it is safe to call before capturing.
+ * Returns 0 both when the API is unreachable and when no cards are fitted;
+ * call dl_api_available() to tell those apart. */
 int32_t dl_device_count(void);
 /* Writes the device's display name (e.g. "DeckLink Quad (1)") into `buf`. */
 int32_t dl_device_name(int32_t index, char *buf, size_t buf_len);
@@ -158,11 +166,20 @@ void dl_close(dl_capture *cap);
  * `mode` must be an explicit DeckLink 4CC ("Hi50", "Hp25", ...) — playout has
  * nothing to auto-detect from.
  *
+ * Video and audio share ONE 90 kHz playout timeline whose origin is the start
+ * of scheduled playback, and the caller owns it: both essences are scheduled at
+ * `essence_pts_90k - first_video_pts_90k`. The shim never derives a display
+ * time from how many writes have succeeded, so a write the caller skips or one
+ * that fails (decode error, raster mismatch, DL_TIMEOUT, a keyframe wait after
+ * a discontinuity) leaves a hole in the picture but does not shift the frames
+ * after it — audio stays in sync.
+ *
+ * The SDK requires frames be scheduled in ascending display order, so a
+ * `stream_time_90k` that does not advance is refused with DL_ERR_TIME rather
+ * than handed to the SDK.
+ *
  * Audio (optional): when `audio_channels` > 0 the device is opened with
- * timestamped scheduled audio at 48 kHz, 32-bit signed interleaved. Audio
- * samples are scheduled on the SAME 90 kHz timeline as video (shared
- * StartScheduledPlayback), so a caller that supplies each block's stream time
- * as `audio_pts_90k - first_video_pts_90k` gets hardware A/V sync.
+ * timestamped scheduled audio at 48 kHz, 32-bit signed interleaved.
  */
 #define DL_PLAYOUT_PREROLL 3
 #define DL_PLAYOUT_MAX_INFLIGHT 8
@@ -180,12 +197,18 @@ int32_t dl_playout_open(const char *device, const char *mode,
 int32_t dl_playout_info(const dl_playout *po, int32_t *width, int32_t *height,
                         int32_t *row_bytes, int64_t *fr_num, int64_t *fr_den);
 
-/* Copies `size` bytes into a card frame and schedules it after the previous
- * one. Blocks (bounded) while the in-flight window is full. DL_ERR_STOPPED
- * after dl_playout_close, DL_TIMEOUT if the card stops draining, DL_ERR_PARAM
- * on a size mismatch. */
-int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size);
+/* Copies `size` bytes into a card frame and schedules it for display at
+ * `stream_time_90k` on the shared 90 kHz playout timeline. Blocks (bounded)
+ * while the in-flight window is full. DL_ERR_STOPPED after dl_playout_close,
+ * DL_TIMEOUT if the card stops draining, DL_ERR_PARAM on a size mismatch,
+ * DL_ERR_TIME if `stream_time_90k` does not advance past the last frame
+ * scheduled. */
+int32_t dl_playout_write_video(dl_playout *po, const uint8_t *data, size_t size,
+                               int64_t stream_time_90k);
+/* As above, additionally attaching `ancillary_count` VANC packets to the frame.
+ * The packets are copied; the caller keeps ownership. */
 int32_t dl_playout_write_video_anc(dl_playout *po, const uint8_t *data, size_t size,
+                                   int64_t stream_time_90k,
                                    const dl_anc_packet *ancillary,
                                    size_t ancillary_count);
 
