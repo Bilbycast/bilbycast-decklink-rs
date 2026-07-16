@@ -153,7 +153,9 @@ pub struct DecklinkCaptureConfig {
     pub audio_sample_rate: u32,
 }
 
-/// One packed 4:2:2 video frame off the SDI input.
+/// One generic VANC ancillary packet captured alongside a video frame.
+/// Protocol-agnostic — the caller decides what `did`/`sdid`/`data` mean
+/// (e.g. SCTE-104 is DID `0x41`/SDID `0x07` per SMPTE 2010).
 #[derive(Debug, Clone)]
 pub struct CapturedAncillaryPacket {
     pub did: u8,

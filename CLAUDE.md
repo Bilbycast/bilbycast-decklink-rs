@@ -103,6 +103,34 @@ runtime (kernel driver + `libDeckLinkAPI.so`).
   preroll already began playback) and are dropped — dropping past audio
   keeps sync, so the caller must not treat pre-first-success failures as
   errors.
+* **Generic VANC ancillary capture and playout.** `CapturedVideo.ancillary:
+  Vec<CapturedAncillaryPacket>` carries every VANC packet (`did`, `sdid`,
+  `line_number`, `data`) alongside each captured frame — extracted via
+  `IDeckLinkVideoFrameAncillaryPackets`/`GetPacketIterator`, filtered to
+  `bmdAncillaryDataSpaceVANC` (HANC is not surfaced). The shim copies packet
+  bytes out of the SDK's buffer *inside* the capture callback, same rule as
+  pixel data — the SDK frame (and its packets) are invalid the moment the
+  callback returns. This crate is deliberately protocol-agnostic: it knows
+  nothing about SCTE-104/DID `0x41`/SDID `0x07` or any other VANC payload
+  semantics — that belongs entirely to the caller (bilbycast-edge).
+  `DecklinkPlayout::write_video_with_ancillary(data, &[CapturedAncillaryPacket])`
+  is the write side: implements `IDeckLinkAncillaryPacket` on a small
+  ref-counted C++ class (`OutputAncillaryPacket`) and attaches it via
+  `IDeckLinkVideoFrameAncillaryPackets::AttachPacket` on the same
+  `CreateVideoFrame`-returned frame the plain video path already schedules —
+  no restructuring of the existing playout flow. **Two non-obvious hardware
+  requirements found only by testing, not documented anywhere in the SDK
+  headers**: (1) the custom output packet class must answer `QueryInterface`
+  for *both* `IUnknown` and `IDeckLinkAncillaryPacket` — refusing either
+  silently drops the packet; (2) `EnableVideoOutput` must be called with
+  `bmdVideoOutputVANC`, not `bmdVideoOutputFlagDefault` — `AttachPacket`
+  itself returns `S_OK` either way, but the packet never reaches the wire
+  without the VANC output flag. Verified on a DeckLink Quad 2 at 1080i50:
+  `GetLineNumber() → 0` (auto-placement) was emitted by the card on physical
+  VANC line 9; 500 scheduled frames, 0 late, 0 dropped, exact byte-for-byte
+  SCTE-104 payload recovered on a looped capture port. `examples/
+  capture_ancillary.rs` / `examples/playout_ancillary.rs` are the paired
+  hardware-loop tools that reproduce this.
 * **Two traps in the status API.** `CurrentVideoInputMode` returns a bogus
   `'ntsc'` default on an unlocked port instead of failing, so it is deliberately
   *not* exposed — `DetectedVideoInputMode` is the honest one. And several
