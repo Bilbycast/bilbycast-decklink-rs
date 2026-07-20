@@ -1,2 +1,6 @@
 /target
 **/target
+# Lib-only wrapper workspace: the lock is a build artefact, not a shipped
+# input. Matches bilbycast-mxl-rs; the consuming binary (bilbycast-edge)
+# owns the resolved dependency graph.
+Cargo.lock
