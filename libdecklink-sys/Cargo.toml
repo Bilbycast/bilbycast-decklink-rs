@@ -10,5 +10,5 @@ description = "Raw FFI to a C ABI shim over the Blackmagic DeckLink SDK (capture
 doctest = false
 
 [build-dependencies]
-bindgen = "0.73.1"
+bindgen = "0.73.2"
 cc = "1"
